@@ -1,0 +1,34 @@
+[package]
+name    = "mmo-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "2D top-down debugger GUI for the MMO client protocol."
+
+[dependencies]
+# Reuse the CLI's auth/gateway/GameClient plumbing. Path dep during
+# development; switch to git once the viewer stabilises.
+mmo-cli = { path = "../mmo-cli" }
+
+# macroquad: a ~single-crate 2D game library with its own window, event
+# loop, camera, input, shapes and text APIs. Chosen here for its zero
+# ceremony — no separate renderer/ECS/audio stack to wire up, and no
+# wgpu lifetime gymnastics.
+macroquad = "0.4"
+
+# Tokio runs on a dedicated OS thread (macroquad owns the main thread
+# with its own single-threaded executor), so we need full features for
+# the gRPC clients + GameClient task.
+tokio = { version = "1", features = ["full"] }
+
+# For receiving events from the net thread without blocking the render
+# loop. tokio::sync::mpsc is fine but its recv() requires async; we
+# peek-only on the render side, so use try_recv on an unbounded channel.
+crossbeam-channel = "0.5"
+
+# Config loading (reuse mmo-cli's ClientConfig).
+config = "0.14"
+serde  = { version = "1", features = ["derive"] }
+
+# Logging.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

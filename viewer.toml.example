@@ -1,0 +1,34 @@
+# Viewer configuration.
+#
+# Copy to `viewer.toml` (or set env vars VIEWER_*) and edit.
+# Defaults live in src/config.rs; anything omitted here falls back to them.
+
+# ── Network endpoints ──────────────────────────────────────────────────────
+# Point these at whichever stack you want to poke at. Defaults are localhost,
+# the values below are the dev cluster (alpha auth + beta gateway).
+auth_service_url = "http://192.168.1.13:50051"
+gateway_url      = "http://192.168.1.12:8090"
+
+# ── Auth timing (same semantics as mmo-cli/client.toml) ────────────────────
+session_auth_retries    = 3
+session_auth_timeout_ms = 5000
+input_hz                = 30
+input_redundancy        = 3
+
+# ── Viewer credentials ─────────────────────────────────────────────────────
+# The viewer issues a best-effort `register` before logging in, so an
+# unused name will self-provision on a dev stack.
+username = "viewer"
+password = "viewer"
+
+# ── Initial spawn position (used only if auth-service has no saved state) ──
+start_x = 0.0
+start_z = 0.0
+
+# ── Camera / HUD tuning ────────────────────────────────────────────────────
+# `view_range` is the world-space height covered by the window. Wider = see
+# more, smaller = see detail.
+view_range        = 80.0
+# Entities silent for longer than this are pruned from the HUD. Keep it a
+# bit above the shard's AOI broadcast period.
+stale_entity_secs = 5.0

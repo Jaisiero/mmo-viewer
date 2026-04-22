@@ -1,0 +1,6 @@
+/target
+viewer.toml
+
+# Cargo.lock is intentionally tracked: mmo-viewer is a binary crate, so
+# pinning dependency versions is the convention (gives anyone who clones
+# a reproducible build).
