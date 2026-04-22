@@ -996,6 +996,7 @@ dependencies = [
 [[package]]
 name = "mmo-cli"
 version = "0.1.0"
+source = "git+https://github.com/Jaisiero/mmo-cli.git#1b01a352abe559912ca2190a795f8a042fe7ba41"
 dependencies = [
  "config",
  "crossterm",

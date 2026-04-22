@@ -5,9 +5,10 @@ edition = "2024"
 description = "2D top-down debugger GUI for the MMO client protocol."
 
 [dependencies]
-# Reuse the CLI's auth/gateway/GameClient plumbing. Path dep during
-# development; switch to git once the viewer stabilises.
-mmo-cli = { path = "../mmo-cli" }
+# Reuse the CLI's auth/gateway/GameClient plumbing. Git dep (same
+# convention as entanglement-rs / entanglement-net) so the viewer
+# compiles standalone without a sibling mmo-cli checkout.
+mmo-cli = { git = "https://github.com/Jaisiero/mmo-cli.git" }
 
 # macroquad: a ~single-crate 2D game library with its own window, event
 # loop, camera, input, shapes and text APIs. Chosen here for its zero
