@@ -166,10 +166,22 @@ impl World {
                 hp,
                 stamina,
             } => {
+                // StateAck and EntityMove arrive in *wire space* — coordinates
+                // relative to the current shard's origin (see
+                // `entanglement-server::session::world_to_wire`). Each shard
+                // has its own origin (typically the lower-left of its region),
+                // so the same world position emits different wire coordinates
+                // on different shards. After a handoff, the next StateAck
+                // comes from the destination shard with its own origin: if
+                // we render the wire coordinates as world coordinates we get
+                // a visible jump of `dest.origin - src.origin` units —
+                // exactly the "tirón de rectificación" reported across handoffs
+                // (also reproduces in mmo-cli when the equivalent transform
+                // is omitted; mmo-cli applies it via `wire_to_world`).
                 self.server_tick = server_tick;
-                self.self_x = x;
-                self.self_y = y;
-                self.self_z = z;
+                self.self_x = x + self.origin_x;
+                self.self_y = y; // y has no shard origin offset.
+                self.self_z = z + self.origin_z;
                 self.self_hp = hp;
                 self.self_stamina = stamina;
             }
@@ -181,13 +193,23 @@ impl World {
                 z,
                 orientation,
             } => {
+                // Wire-to-world transform on cross-shard ghost / local
+                // entity updates — see the StateAck branch for the
+                // detailed why. Without this transform, ghosts at
+                // multi-shard borders flicker and snap when the
+                // emitting shard changes (different origin → different
+                // wire offset for the same world point).
                 let e = self
                     .entities
                     .entry(entity_id)
                     .or_insert_with(|| Entity::new(entity_id));
-                e.x = x;
+                // Entity fields are f32 (render-friendly); origin is f64
+                // (matches the wire / session). Cast happens here once
+                // per update; precision loss is irrelevant at the
+                // sub-metre scale we render.
+                e.x = x + self.origin_x as f32;
                 e.y = y;
-                e.z = z;
+                e.z = z + self.origin_z as f32;
                 e.orientation = orientation;
                 e.last_seen = Instant::now();
             }
