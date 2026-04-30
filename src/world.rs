@@ -15,9 +15,20 @@ use crate::channels::NetEvent;
 /// A single entity the viewer knows about. All fields come directly from
 /// protocol events; nothing is interpolated — the renderer uses these
 /// raw values so we can see the server's truth, not a smoothed picture.
+///
+/// The local player is stored here too, keyed by `persistent_id`, with
+/// `is_self = true`. Storing self alongside ghosts means handoff
+/// transitions don't have to drop+recreate any entity record (the
+/// previous "wipe self_x/y/z + repopulate" cycle is gone), and the old
+/// session-vs-persistent ID confusion in the render filter — which was
+/// silently hiding any bot whose persistent ID happened to collide with
+/// the freshly-issued session id, then unhiding it on the next handoff
+/// — disappears at the source.
 #[derive(Debug, Clone)]
 pub struct Entity {
-    pub id: u32,
+    // Note: the entity_id is the `entities: HashMap<u32, _>` key —
+    // we don't carry it as a struct field. The previous `pub id:
+    // u32` was only read by a since-removed render filter.
     /// World-space X (cross-shard coord, i.e. origin-relative).
     pub x: f32,
     pub y: f32,
@@ -33,12 +44,30 @@ pub struct Entity {
     /// to age out dead entities after a timeout — the shard doesn't send
     /// an explicit "despawn" for AOI exits, so this is the only cue.
     pub last_seen: Instant,
+    /// True for the local player's own record (the one populated from
+    /// `StateAck`). The renderer draws self as a triangle and others as
+    /// circles; pruning skips self so a few hundred milliseconds without
+    /// a `StateAck` (handoff window) doesn't wipe the camera target.
+    pub is_self: bool,
+    /// True once we've received an `EntityMoved` (or `StateAck` for
+    /// self) that placed this entity at a real world position. Other
+    /// updates (`EntityHealth`, `EntityStateChanged`, `HitConfirm`)
+    /// can arrive before the first move on a fresh shard — for a
+    /// reconnect after handoff, the destination's first batch may
+    /// emit Health or State for an entity in a different order than
+    /// Move, causing a one-frame flash at (0, 0, 0) which the user
+    /// observes as the "bots disappear and reappear during handoff"
+    /// glitch (the flash is off-screen if you're not at the world
+    /// origin). The renderer skips entities whose position is not
+    /// yet set; the missed Health/State update gets stamped onto the
+    /// entity once the position update lands and any subsequent
+    /// Health/State delta from the server.
+    pub has_position: bool,
 }
 
 impl Entity {
-    fn new(id: u32) -> Self {
+    fn new() -> Self {
         Self {
-            id,
             x: 0.0,
             y: 0.0,
             z: 0.0,
@@ -48,6 +77,8 @@ impl Entity {
             combat_state: 0,
             combat_param: 0,
             last_seen: Instant::now(),
+            is_self: false,
+            has_position: false,
         }
     }
 
@@ -62,9 +93,13 @@ impl Entity {
     }
 }
 
-/// Everything the renderer needs. `session` carries our own player's
-/// authoritative position (from `StateAck`), `entities` carries the
-/// neighbours (from `EntityMoved`/`EntityHealth`/`EntityStateChanged`).
+/// Everything the renderer needs. The `entities` map holds **all**
+/// players we know about, including the local one (keyed by
+/// `persistent_id`, with `is_self = true`). HUD-only scalars
+/// (`self_x/y/z/hp/stamina`) shadow the local entity's position +
+/// vitals so the HUD and camera don't have to do a HashMap lookup
+/// every frame; they're refreshed from the same `StateAck` that
+/// updates the entity record, so they never drift.
 #[derive(Debug)]
 pub struct World {
     pub connected: bool,
@@ -77,7 +112,9 @@ pub struct World {
     pub origin_z: f64,
     pub server_tick: u32,
 
-    /// Our own authoritative position (from StateAck).
+    /// Our own authoritative position (from StateAck). Mirrored from
+    /// the `is_self` entity in `entities` for the HUD and camera —
+    /// see `apply` for the StateAck handler that keeps both in sync.
     pub self_x: f64,
     pub self_y: f64,
     pub self_z: f64,
@@ -94,11 +131,26 @@ pub struct World {
     /// exactly what we sent, so we trust the client for drawing.
     pub self_orientation: f32,
 
-    /// Most recent PlayerAction we emitted (code, when). Used to paint
-    /// a short client-side "I pressed the button" flash so the viewer
-    /// has feedback even for actions the server doesn't translate into
-    /// a visible `combat_state` change (e.g. jump, dodge).
+    /// Most recent PlayerAction we emitted (code, when). Mirror of the
+    /// `is_self` entity's `action_flash`, kept on `World` for the input
+    /// loop's convenience; the renderer reads from the entity record.
     pub self_action_flash: Option<(u8, Instant)>,
+
+    /// Last input intent from the local user (`move_x`, `move_z`),
+    /// updated every frame from `InputState` before the GuiCmd is
+    /// emitted. Used by the handoff dead-reckoning path so the camera
+    /// keeps panning during the ~25 ms reconnect window — without
+    /// this the user sees their own character "freeze" mid-step
+    /// every time they cross a shard boundary.
+    pub last_input_x: f32,
+    pub last_input_z: f32,
+
+    /// `Some(t)` while a shard handoff is in flight (between
+    /// `HandoffStarted` and the next `SessionOpened` /
+    /// post-handoff `StateAck`). Carries the moment the handoff
+    /// began so the renderer can extrapolate the local player's
+    /// position by `last_input * PLAYER_SPEED * elapsed`.
+    pub handoff_predicting_since: Option<Instant>,
 
     pub entities: HashMap<u32, Entity>,
 }
@@ -124,6 +176,9 @@ impl Default for World {
             last_rejection: None,
             self_orientation: 0.0,
             self_action_flash: None,
+            last_input_x: 0.0,
+            last_input_z: 0.0,
+            handoff_predicting_since: None,
             entities: HashMap::new(),
         }
     }
@@ -151,6 +206,18 @@ impl World {
                 self.origin_z = origin_z;
                 self.shard_id = shard_id;
                 self.status = format!("session open — shard {shard_id}");
+
+                // Defensive: clear any stale `is_self` flag from a
+                // previous identity. Normal handoffs preserve
+                // `persistent_id` so this is a no-op, but if we ever
+                // reconnect as a different user (or the wire payload
+                // disagrees), the old self record reverts to being
+                // drawn as a regular entity until pruning catches it.
+                for (id, e) in self.entities.iter_mut() {
+                    if e.is_self && *id != persistent_id {
+                        e.is_self = false;
+                    }
+                }
             }
 
             NetEvent::AuthFailed { reason } => {
@@ -166,12 +233,63 @@ impl World {
                 hp,
                 stamina,
             } => {
+                // StateAck and EntityMove arrive in *wire space* — coordinates
+                // relative to the current shard's origin (see
+                // `entanglement-server::session::world_to_wire`). Each shard
+                // has its own origin; transforming to world space here means
+                // the renderer can use a single coordinate frame across
+                // handoffs (the alternative is to retransform every entity
+                // every frame, or live with a `dest.origin - src.origin`
+                // jump at every shard boundary).
                 self.server_tick = server_tick;
-                self.self_x = x;
-                self.self_y = y;
-                self.self_z = z;
+                let world_x = x + self.origin_x;
+                let world_y = y;
+                let world_z = z + self.origin_z;
+                self.self_x = world_x;
+                self.self_y = world_y;
+                self.self_z = world_z;
                 self.self_hp = hp;
                 self.self_stamina = stamina;
+
+                // First StateAck after a handoff ends the dead-
+                // reckoning window: snap the camera target back to
+                // the authoritative server position. With the
+                // server-side position-extrapolation fix in place
+                // (`pos += vel * elapsed` in mmo-shard's
+                // on_player_join), the snap distance is sub-metre
+                // even at full PLAYER_SPEED, so the visual jolt is
+                // imperceptible.
+                self.handoff_predicting_since = None;
+
+                // Mirror the local player into the unified `entities`
+                // store keyed by `persistent_id`. This is the change
+                // that kills the "stationary bots flicker on/off across
+                // handoffs" bug: the previous renderer filtered out any
+                // entity whose id matched `world.player_id` (the
+                // *session* id, ephemeral and reissued each shard), so
+                // bots whose persistent IDs happened to collide with
+                // the freshly-issued session id were silently hidden
+                // until the next handoff swapped the colliding id. With
+                // self stored as a normal entity (and the filter gone
+                // in `render.rs`), no other entity is ever skipped.
+                //
+                // We only insert once we actually have a `persistent_id`
+                // (set by SessionOpened). Before that there's nothing
+                // to key on; the `self_*` scalars cover the bootstrap
+                // window for the HUD.
+                if self.persistent_id != 0 {
+                    let e = self.entities
+                        .entry(self.persistent_id)
+                        .or_insert_with(|| Entity::new());
+                    e.is_self = true;
+                    e.x = world_x as f32;
+                    e.y = world_y as f32;
+                    e.z = world_z as f32;
+                    e.hp = hp;
+                    e.max_hp = e.max_hp.max(hp).max(1);
+                    e.last_seen = Instant::now();
+                    e.has_position = true;
+                }
             }
 
             NetEvent::EntityMoved {
@@ -181,15 +299,33 @@ impl World {
                 z,
                 orientation,
             } => {
+                // The local player's authoritative position lives on
+                // `StateAck`; if the server happens to also broadcast
+                // self via EntityMove (some configs do), don't let it
+                // double-write here — the two sources update at
+                // slightly different cadences and would race. We still
+                // refresh `last_seen` so pruning doesn't misfire.
+                if entity_id == self.persistent_id {
+                    if let Some(e) = self.entities.get_mut(&entity_id) {
+                        e.last_seen = Instant::now();
+                    }
+                    return;
+                }
                 let e = self
                     .entities
                     .entry(entity_id)
-                    .or_insert_with(|| Entity::new(entity_id));
-                e.x = x;
+                    .or_insert_with(|| Entity::new());
+                // Wire-to-world transform: see the StateAck branch.
+                // Entity fields are f32 (render-friendly); origin is
+                // f64 (matches the wire / session). Cast happens here
+                // once per update; precision loss is irrelevant at the
+                // sub-metre scale we render.
+                e.x = x + self.origin_x as f32;
                 e.y = y;
-                e.z = z;
+                e.z = z + self.origin_z as f32;
                 e.orientation = orientation;
                 e.last_seen = Instant::now();
+                e.has_position = true;
             }
 
             NetEvent::EntityHealth {
@@ -200,7 +336,7 @@ impl World {
                 let e = self
                     .entities
                     .entry(entity_id)
-                    .or_insert_with(|| Entity::new(entity_id));
+                    .or_insert_with(|| Entity::new());
                 e.hp = hp;
                 e.max_hp = max_hp.max(1);
                 e.last_seen = Instant::now();
@@ -214,7 +350,7 @@ impl World {
                 let e = self
                     .entities
                     .entry(entity_id)
-                    .or_insert_with(|| Entity::new(entity_id));
+                    .or_insert_with(|| Entity::new());
                 e.combat_state = state_id;
                 e.combat_param = param_a;
                 e.last_seen = Instant::now();
@@ -229,7 +365,12 @@ impl World {
                     e.hp = target_hp;
                     e.last_seen = Instant::now();
                 }
-                if target_id == self.player_id {
+                // Wire `target_id` is `entity_id` (persistent_id), NOT
+                // the per-shard session id. Comparing against
+                // `world.player_id` (the session id) was the
+                // long-standing bug that left `self_hp` stuck on the
+                // initial value across hits.
+                if target_id == self.persistent_id {
                     self.self_hp = target_hp;
                 }
             }
@@ -244,6 +385,15 @@ impl World {
                 self.status = String::from("disconnected");
             }
 
+            NetEvent::HandoffStarted => {
+                // Enter dead-reckoning for the local player. The
+                // renderer will extrapolate `self_x/self_z` by
+                // `last_input * PLAYER_SPEED * elapsed` until the
+                // next StateAck arrives — typically 15-30 ms — so
+                // the camera doesn't visibly freeze mid-step.
+                self.handoff_predicting_since = Some(Instant::now());
+            }
+
             NetEvent::RttSample(ms) => self.rtt_ms = ms,
         }
     }
@@ -253,19 +403,82 @@ impl World {
     /// out of the raw `self_*` fields so we only have one source of
     /// truth: the entities map, which is what the renderer already
     /// iterates for neighbours.
-    pub fn self_combat_state(&self) -> u16 {
-        self.entities
-            .get(&self.player_id)
-            .map(|e| e.combat_state)
-            .unwrap_or(0)
+    /// Local player position to render with: the authoritative
+    /// `self_x/self_z` outside a handoff window, or a dead-reckoned
+    /// extrapolation while `handoff_predicting_since` is live.
+    ///
+    /// The extrapolation uses `last_input_*` (the raw key intent
+    /// captured by `input::poll`) at `PLAYER_SPEED = 5.0`, which is
+    /// what the server applies for inputs that pass dedup. It's
+    /// purely a visual smoothing — the StateAck on the new shard
+    /// snaps the value back to the authoritative position the
+    /// moment it arrives. Capped at 200 ms so a stalled handoff
+    /// (network partition, rare) doesn't fling the camera off
+    /// across the world.
+    pub fn predicted_self_pos(&self) -> (f64, f64) {
+        const MAX_PREDICTION_SECS: f64 = 0.2;
+        // Server-side PLAYER_SPEED in m/s. Has to match
+        // `mmo-shard::player::PLAYER_SPEED` so the dead-reckoned
+        // motion looks like the post-handoff first ack.
+        const PLAYER_SPEED: f64 = 5.0;
+        let Some(since) = self.handoff_predicting_since else {
+            return (self.self_x, self.self_z);
+        };
+        let elapsed = since.elapsed().as_secs_f64().min(MAX_PREDICTION_SECS);
+        let dx = self.last_input_x as f64 * PLAYER_SPEED * elapsed;
+        let dz = self.last_input_z as f64 * PLAYER_SPEED * elapsed;
+        (self.self_x + dx, self.self_z + dz)
+    }
+
+    /// Position to render an entity at — currently identity, just
+    /// returns the entity's authoritative `(x, z)` from the latest
+    /// EntityMoved.
+    ///
+    /// The previous version dead-reckoned ghosts during the handoff
+    /// window using a velocity estimated from position deltas, but
+    /// the estimate was inherently noisy: it conflated direction
+    /// changes (a bot turning right just before the gap predicted
+    /// straight on, then snap-corrected when the dest's first
+    /// broadcast arrived), ghost↔real role switches (the same bot
+    /// moving from "ghost replicated from neighbour" to "real on
+    /// the new shard" reset the velocity continuity), and ghost-
+    /// stream jitter. Different bots ended up with different
+    /// prediction quality during the same handoff — visible as
+    /// "inconsistencia de players y ghosts" reported by the user.
+    ///
+    /// Local-player dead-reckoning (`predicted_self_pos`) doesn't
+    /// have this problem because it uses the user's *input* keys
+    /// directly at PLAYER_SPEED, which matches what the server
+    /// actually applied — it's deterministic, not estimated. So
+    /// that path stays.
+    ///
+    /// Net effect: ghosts visibly freeze for ~25 ms during the
+    /// handoff window. Uniform freeze across all bots is a less
+    /// jarring artefact than per-bot misprediction, and the local
+    /// player keeps panning smoothly so the world doesn't feel
+    /// stuck. If the freeze becomes the dominant complaint we can
+    /// add a snap-smoothing layer that lerps toward the
+    /// authoritative position over a few frames after each
+    /// EntityMoved — that path doesn't predict forward, only
+    /// smooths discontinuities, so it can't go off-direction.
+    pub fn predicted_entity_pos(&self, e: &Entity) -> (f32, f32) {
+        (e.x, e.z)
     }
 
     /// Drop entities we haven't heard from in `stale_secs`. Called every
     /// frame; cheap because the set is small.
+    ///
+    /// `is_self` records are explicitly preserved: a 100 ms handoff
+    /// window briefly stops both `StateAck` and `EntityMove` for the
+    /// local player while the new UDP session opens, and pruning self
+    /// would wipe the camera target right when the user is mid-cross.
+    /// The local player record is owned by `SessionOpened` (insert) and
+    /// never expires implicitly.
     pub fn prune_stale(&mut self, stale_secs: f32) {
         let now = Instant::now();
         self.entities.retain(|_, e| {
-            now.duration_since(e.last_seen).as_secs_f32() < stale_secs
+            e.is_self
+                || now.duration_since(e.last_seen).as_secs_f32() < stale_secs
         });
     }
 }

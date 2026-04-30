@@ -7,17 +7,19 @@
 //!   NET → GUI: `NetEvent`  (status + session + per-entity updates)
 //!
 //! The bootstrap sequence is the same one `mmo-cli` uses (auth-service
-//! login → gateway player_connect → GameClient::connect + wait_for_open)
-//! but simplified: we read credentials from the viewer's own config,
-//! there's no interactive lobby, and we don't bother with re-routing on
-//! SHARD_DRAINING — if the shard rejects us at startup we just report
-//! the error and exit. The viewer is a debugger, not a resilient
-//! long-running client.
+//! login → gateway player_connect → GameClient::connect + wait_for_open),
+//! and during the hot loop the viewer also handles `SHARD_HANDOFF` the
+//! same way the CLI does in `gameplay.rs`: when one arrives we tear down
+//! the current `GameClient` and reconnect to the new shard via
+//! `connect_with_handoff_auth`. If that target is itself draining we
+//! bounce through the gateway with the last known position. There's also
+//! a 250 ms grace period on a bare `Disconnected` to catch a late
+//! handoff message — same trick the CLI uses.
 
 use std::time::{Duration, Instant};
 
 use mmo_cli::auth_client::AuthServiceClient;
-use mmo_cli::game_client::{GameClient, GameEvent};
+use mmo_cli::game_client::{AuthError, GameClient, GameEvent};
 use mmo_cli::gateway_client::GatewayClient;
 
 use tokio::runtime::Builder;
@@ -112,10 +114,13 @@ async fn run(cfg: ViewerConfig, ch: NetChannels) {
     }
 
     // Publish the opened session so the renderer can switch from "loading"
-    // to "playing" and lock the camera to `player_id`.
+    // to "playing" and lock the camera to `player_id`. `persistent_id`
+    // survives shard handoffs and is what the new shard expects in the
+    // HandoffAuth packet, so we capture it here too.
+    let persistent_id = client.session.persistent_id;
     let _ = net_events.send(NetEvent::SessionOpened {
         player_id: client.session.player_id,
-        persistent_id: client.session.persistent_id,
+        persistent_id,
         origin_x: client.session.origin_x,
         origin_z: client.session.origin_z,
         shard_id: client.session.shard_id,
@@ -131,7 +136,12 @@ async fn run(cfg: ViewerConfig, ch: NetChannels) {
     //   3. If the input-hz clock elapsed, send a PlayerMove reflecting
     //      the latest input.
     //   4. Emit a Ping every 500 ms so the HUD can show RTT.
-    run_hot_loop(client, net_events.clone(), gui_cmds, &cfg).await;
+    //   5. On `ShardHandoffReceived` (or a late one within 250 ms of a
+    //      bare `Disconnected`), reconnect to the new shard and keep
+    //      going. `gateway` and `jwt` ride into the loop so we can
+    //      bounce through the gateway if the target shard is also
+    //      draining.
+    run_hot_loop(client, net_events.clone(), gui_cmds, &cfg, jwt, persistent_id, gateway).await;
     status("net loop exited");
 }
 
@@ -140,6 +150,9 @@ async fn run_hot_loop(
     net_events: crossbeam_channel::Sender<NetEvent>,
     gui_cmds: crossbeam_channel::Receiver<GuiCmd>,
     cfg: &ViewerConfig,
+    jwt: String,
+    persistent_id: u32,
+    mut gateway: GatewayClient,
 ) {
     #[derive(Default, Clone)]
     struct InputState {
@@ -157,6 +170,14 @@ async fn run_hot_loop(
     let mut last_input_tx = Instant::now();
     let mut last_ping_tx = Instant::now();
     let mut last_rtt_us = 0u64;
+    // Last known world-space player position. We seed it from the
+    // initial origin and keep it fresh from `StateAck` so a
+    // gateway-bounce after a draining target shard can re-route to the
+    // correct region. f32 because that's what the gateway proto takes.
+    let mut last_pos = (
+        client.session.origin_x as f32,
+        client.session.origin_z as f32,
+    );
 
     loop {
         // 1. Drain GUI commands. try_recv is non-blocking; `disconnected`
@@ -190,7 +211,38 @@ async fn run_hot_loop(
         }
 
         // 2. Poll the game client and forward events.
-        for ev in client.poll_events() {
+        //    `Disconnected` and `ShardHandoffReceived` need batch-level
+        //    handling (handoff vs. graceful close vs. genuine drop), so
+        //    we collect first, forward the rest, and react after.
+        let events = client.poll_events();
+        let handoff_target = events.iter().find_map(|e| match e {
+            GameEvent::ShardHandoffReceived {
+                new_ip,
+                new_port,
+                new_shard_id,
+                handoff_token,
+                ..
+            } => Some((new_ip.clone(), *new_port, *new_shard_id, *handoff_token)),
+            _ => None,
+        });
+        let saw_disconnect = events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Disconnected));
+
+        for ev in events {
+            // Track player position so a `RetryViaGateway` after a
+            // ShardDraining target can re-route correctly. World-space
+            // (StateAck.x / .z is already world-space, not wire-relative).
+            if let GameEvent::StateAck { x, z, .. } = &ev {
+                last_pos = (*x as f32, *z as f32);
+            }
+            // Defer Disconnected / ShardHandoffReceived to the
+            // post-loop handler — emitting NetEvent::Disconnected here
+            // would flicker the HUD into "not in session" before the
+            // reconnect we're about to do.
+            if matches!(ev, GameEvent::Disconnected | GameEvent::ShardHandoffReceived { .. }) {
+                continue;
+            }
             if let Some(mapped) = map_event(ev) {
                 // If the session got a fresher RTT, forward that too.
                 if client.session.last_rtt_us != last_rtt_us {
@@ -204,6 +256,90 @@ async fn run_hot_loop(
                     client.stop();
                     return;
                 }
+            }
+        }
+
+        // 2b. Handle handoff or grace period before sending inputs/pings.
+        if let Some((new_ip, new_port, new_shard_id, handoff_token)) = handoff_target {
+            if !do_handoff(
+                &mut client,
+                cfg,
+                &jwt,
+                persistent_id,
+                &new_ip,
+                new_port,
+                new_shard_id,
+                handoff_token,
+                &mut gateway,
+                last_pos,
+                &net_events,
+            )
+            .await
+            {
+                return;
+            }
+            // After a successful handoff, origin shifts; refresh
+            // `last_pos` to the new origin so the next loop iteration
+            // doesn't carry stale wire-space coordinates.
+            last_pos = (
+                client.session.origin_x as f32,
+                client.session.origin_z as f32,
+            );
+        } else if saw_disconnect {
+            // Grace period (mirrors mmo-cli/src/gameplay.rs:678-735):
+            // a `Disconnected` without a preceding handoff might be the
+            // shard tearing down the UDP socket microseconds before the
+            // SHARD_HANDOFF lands. Poll for one for 250 ms before giving
+            // up.
+            let mut late: Option<(String, u16, u32, u64)> = None;
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                for ev in client.poll_events() {
+                    if let GameEvent::ShardHandoffReceived {
+                        new_ip,
+                        new_port,
+                        new_shard_id,
+                        handoff_token,
+                        ..
+                    } = ev
+                    {
+                        late = Some((new_ip, new_port, new_shard_id, handoff_token));
+                        break;
+                    }
+                }
+                if late.is_some() {
+                    break;
+                }
+            }
+            if let Some((new_ip, new_port, new_shard_id, handoff_token)) = late {
+                let _ = net_events.send(NetEvent::Status(format!(
+                    "⟳ Handoff (late) → shard 0x{:X} at {}:{}",
+                    new_shard_id, new_ip, new_port
+                )));
+                if !do_handoff(
+                    &mut client,
+                    cfg,
+                    &jwt,
+                    persistent_id,
+                    &new_ip,
+                    new_port,
+                    new_shard_id,
+                    handoff_token,
+                    &mut gateway,
+                    last_pos,
+                    &net_events,
+                )
+                .await
+                {
+                    return;
+                }
+                last_pos = (
+                    client.session.origin_x as f32,
+                    client.session.origin_z as f32,
+                );
+            } else {
+                let _ = net_events.send(NetEvent::Disconnected);
+                return;
             }
         }
 
@@ -304,11 +440,143 @@ fn map_event(ev: GameEvent) -> Option<NetEvent> {
             Some(NetEvent::ActionRejected { reason })
         }
         GameEvent::ShardHandoffReceived { .. } => {
-            // MVP: treat a handoff as a disconnect. Reconnecting to the
-            // new shard would require plumbing the handoff token through
-            // the viewer; deferred to phase 2.
-            Some(NetEvent::Disconnected)
+            // Reconnect happens in `run_hot_loop`; this branch is only
+            // reachable defensively if a handoff event slips past the
+            // batch-level filter, in which case dropping it is correct
+            // (we don't want to flash "Disconnected" mid-handoff).
+            None
         }
         GameEvent::Disconnected => Some(NetEvent::Disconnected),
     }
+}
+
+// ── Handoff / gateway-retry helpers ───────────────────────────────────────
+
+/// Tear down the current `GameClient` and reconnect to `new_ip:new_port`
+/// using `HandoffAuth`. On success, publishes a fresh `SessionOpened`
+/// so the renderer can switch its camera/HUD to the new shard.
+///
+/// Returns `false` if the viewer should exit the hot loop (terminal
+/// failure or renderer-gone). On `AuthError::ShardDraining` from the
+/// target — which happens when the absorber shard re-splits before
+/// our packet lands — we bounce through the gateway with `last_pos`
+/// instead of giving up.
+#[allow(clippy::too_many_arguments)]
+async fn do_handoff(
+    client: &mut GameClient,
+    cfg: &ViewerConfig,
+    jwt: &str,
+    persistent_id: u32,
+    new_ip: &str,
+    new_port: u16,
+    new_shard_id: u32,
+    handoff_token: u64,
+    gateway: &mut GatewayClient,
+    last_pos: (f32, f32),
+    net_events: &crossbeam_channel::Sender<NetEvent>,
+) -> bool {
+    let _ = net_events.send(NetEvent::Status(format!(
+        "⟳ Handoff → shard 0x{:X} at {}:{}",
+        new_shard_id, new_ip, new_port
+    )));
+    // Tell the renderer to enter dead-reckoning for the local
+    // player. The next ~15-30 ms have no StateAck arriving (we're
+    // tearing the old session down + opening the new one), and
+    // without prediction the camera + self triangle visibly
+    // freeze mid-step right when the user is mid-cross. The next
+    // post-handoff StateAck clears the flag.
+    let _ = net_events.send(NetEvent::HandoffStarted);
+
+    client.stop();
+    *client = GameClient::new(&cfg.client);
+    client.set_jwt(jwt);
+
+    let connect_res = client
+        .connect_with_handoff_auth(new_ip, new_port, persistent_id, handoff_token)
+        .await;
+    if let Err(e) = connect_res {
+        let _ = net_events.send(NetEvent::Status(format!("✗ Handoff connect failed: {e}")));
+        let _ = net_events.send(NetEvent::Disconnected);
+        return false;
+    }
+
+    match client.wait_for_session_open().await {
+        Ok(()) => {
+            publish_session_opened(client, net_events);
+            true
+        }
+        Err(AuthError::ShardDraining) => {
+            // Target shard is itself draining — typically because a
+            // merge absorber split again, or the orchestrator picked
+            // an already-overloaded shard. Re-ask the gateway with the
+            // last known world position. Same fallback `mmo-cli` runs
+            // (gameplay.rs:765-772 → RetryViaGateway).
+            retry_via_gateway(client, cfg, jwt, gateway, last_pos, net_events).await
+        }
+        Err(AuthError::Other(e)) => {
+            let _ = net_events.send(NetEvent::Status(format!("✗ Handoff auth failed: {e}")));
+            let _ = net_events.send(NetEvent::Disconnected);
+            false
+        }
+    }
+}
+
+/// Re-ask the gateway for a shard assignment from `last_pos` and
+/// reconnect with a regular `SessionAuth`. Used when the handoff
+/// target rejects us as draining.
+async fn retry_via_gateway(
+    client: &mut GameClient,
+    cfg: &ViewerConfig,
+    jwt: &str,
+    gateway: &mut GatewayClient,
+    last_pos: (f32, f32),
+    net_events: &crossbeam_channel::Sender<NetEvent>,
+) -> bool {
+    let _ = net_events.send(NetEvent::Status(
+        "⟳ Target draining — re-asking gateway…".into(),
+    ));
+    let shard = match gateway.player_connect(jwt, last_pos.0, last_pos.1).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = net_events.send(NetEvent::Status(format!("✗ Gateway re-route failed: {e}")));
+            let _ = net_events.send(NetEvent::Disconnected);
+            return false;
+        }
+    };
+    client.stop();
+    *client = GameClient::new(&cfg.client);
+    if let Err(e) = client.connect(&shard.ip, shard.port, jwt).await {
+        let _ = net_events.send(NetEvent::Status(format!("✗ Reconnect failed: {e}")));
+        let _ = net_events.send(NetEvent::Disconnected);
+        return false;
+    }
+    match client.wait_for_session_open().await {
+        Ok(()) => {
+            publish_session_opened(client, net_events);
+            true
+        }
+        Err(e) => {
+            let _ = net_events.send(NetEvent::Status(format!(
+                "✗ Session auth after gateway retry failed: {e}"
+            )));
+            let _ = net_events.send(NetEvent::Disconnected);
+            false
+        }
+    }
+}
+
+/// Push a `SessionOpened` mirroring the freshly-opened `client.session`
+/// so the renderer can re-anchor its world view (origin shifts on
+/// every shard handoff).
+fn publish_session_opened(
+    client: &GameClient,
+    net_events: &crossbeam_channel::Sender<NetEvent>,
+) {
+    let _ = net_events.send(NetEvent::SessionOpened {
+        player_id: client.session.player_id,
+        persistent_id: client.session.persistent_id,
+        origin_x: client.session.origin_x,
+        origin_z: client.session.origin_z,
+        shard_id: client.session.shard_id,
+    });
 }

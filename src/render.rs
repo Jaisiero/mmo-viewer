@@ -64,8 +64,14 @@ const GRID_AXIS_COLOUR: Color = Color::new(0.25, 0.25, 0.30, 1.0);
 pub fn draw(world: &World, cfg: &ViewerConfig) {
     clear_background(Color::new(0.05, 0.05, 0.07, 1.0));
 
-    let self_x = world.self_x as f32;
-    let self_z = world.self_z as f32;
+    // During the brief handoff window the server's StateAck stops
+    // arriving for ~15-30 ms. `predicted_self_pos` returns the
+    // authoritative `self_x/self_z` outside that window and a
+    // dead-reckoned extrapolation while it's open, so the camera
+    // doesn't visibly freeze mid-step.
+    let (self_world_x, self_world_z) = world.predicted_self_pos();
+    let self_x = self_world_x as f32;
+    let self_z = self_world_z as f32;
 
     // ── World-space camera ───────────────────────────────────────────
     // Zoom expresses world → NDC: a world length of `range` maps to 2
@@ -86,22 +92,51 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
     set_camera(&camera);
 
     draw_grid(self_x, self_z, range_x, range_y);
+    // Single iteration over the unified entity store. The local player
+    // lives in here too (with `is_self = true`, keyed by
+    // `persistent_id`), so handoff transitions don't drop+recreate any
+    // record and the previous `e.id == world.player_id` filter — which
+    // silently hid bots whose persistent IDs collided with the
+    // freshly-issued *session* id, then unhid them on the next handoff
+    // — is gone.
     for e in world.entities.values() {
-        // Don't double-draw the player if the server happens to echo its
-        // own position as an "entity" too (shouldn't, but guard anyway).
-        if e.id == world.player_id {
+        // Skip entities whose position hasn't been confirmed by an
+        // EntityMoved (or StateAck for self) yet. Health / state
+        // events can land before the first move on a freshly
+        // re-broadcast set of entities (the destination shard's
+        // first batch after handoff isn't guaranteed to put Move
+        // strictly first), and rendering the default (0, 0, 0)
+        // would flash the entity off-screen for a frame — the
+        // visible "bots disappear and reappear during handoff"
+        // effect, since the user is rarely standing at the world
+        // origin.
+        if !e.has_position {
             continue;
         }
-        draw_entity(e);
-    }
-    if world.session_open {
-        draw_self(
-            self_x,
-            self_z,
-            world.self_orientation,
-            world.self_combat_state(),
-            world.self_action_flash,
-        );
+        if e.is_self {
+            if world.session_open {
+                // Use the dead-reckoned position (same as the camera
+                // target) so the triangle and the camera stay locked
+                // together during the ~25 ms handoff window. Outside
+                // that window `self_x/self_z` are the same as
+                // `e.x/e.z` (both updated by the same StateAck).
+                draw_self(
+                    self_x,
+                    self_z,
+                    world.self_orientation,
+                    e.combat_state,
+                    world.self_action_flash,
+                );
+            }
+        } else {
+            // During the handoff window, dead-reckon the ghost too
+            // so remote bots don't visibly freeze for ~25 ms while
+            // the local UDP session swaps shards. `predicted_entity_pos`
+            // is identity outside the window — debugger philosophy
+            // is preserved for normal frames.
+            let (px, pz) = world.predicted_entity_pos(e);
+            draw_entity(e, px, pz);
+        }
     }
 
     // ── HUD pass ─────────────────────────────────────────────────────
@@ -146,12 +181,16 @@ fn draw_grid(cx: f32, cz: f32, range_x: f32, range_y: f32) {
 
 /// Draw a neighbour entity: a filled circle whose colour is derived
 /// from hp (green→red) and whose outline is tinted by combat_state.
-fn draw_entity(e: &Entity) {
+///
+/// `x` / `z` are passed explicitly so the caller can substitute a
+/// dead-reckoned position during the handoff window. Outside the
+/// window they're just `e.x` / `e.z`.
+fn draw_entity(e: &Entity, x: f32, z: f32) {
     const R: f32 = 0.8;
     // HP-fraction lerp from red to green.
     let hp = e.hp_frac();
     let body = Color::new(1.0 - hp, hp, 0.2, 1.0);
-    draw_circle(e.x, e.z, R, body);
+    draw_circle(x, z, R, body);
 
     // Outline colour = combat state tint. State id 0 is "idle" in mmo
     // shard conventions; anything non-zero gets a yellow halo so state
@@ -161,12 +200,12 @@ fn draw_entity(e: &Entity) {
     } else {
         Color::new(1.0, 0.9, 0.2, 1.0)
     };
-    draw_circle_lines(e.x, e.z, R, 0.08, outline);
+    draw_circle_lines(x, z, R, 0.08, outline);
 
     // Orientation tick: short line from centre in the facing direction.
-    let tx = e.x + e.orientation.cos() * (R * 1.4);
-    let tz = e.z + e.orientation.sin() * (R * 1.4);
-    draw_line(e.x, e.z, tx, tz, 0.10, WHITE);
+    let tx = x + e.orientation.cos() * (R * 1.4);
+    let tz = z + e.orientation.sin() * (R * 1.4);
+    draw_line(x, z, tx, tz, 0.10, WHITE);
 }
 
 /// Draw the player as a triangle with its apex in the facing direction.
