@@ -86,22 +86,32 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
     set_camera(&camera);
 
     draw_grid(self_x, self_z, range_x, range_y);
+    // Single iteration over the unified entity store. The local player
+    // lives in here too (with `is_self = true`, keyed by
+    // `persistent_id`), so handoff transitions don't drop+recreate any
+    // record and the previous `e.id == world.player_id` filter — which
+    // silently hid bots whose persistent IDs collided with the
+    // freshly-issued *session* id, then unhid them on the next handoff
+    // — is gone.
     for e in world.entities.values() {
-        // Don't double-draw the player if the server happens to echo its
-        // own position as an "entity" too (shouldn't, but guard anyway).
-        if e.id == world.player_id {
-            continue;
+        if e.is_self {
+            if world.session_open {
+                // The local player's combat_state and position come from
+                // the same entity record. orientation + action_flash are
+                // local-only (driven by the input loop) and stay on
+                // World — there's no wire path that would carry them
+                // back to us anyway.
+                draw_self(
+                    e.x,
+                    e.z,
+                    world.self_orientation,
+                    e.combat_state,
+                    world.self_action_flash,
+                );
+            }
+        } else {
+            draw_entity(e);
         }
-        draw_entity(e);
-    }
-    if world.session_open {
-        draw_self(
-            self_x,
-            self_z,
-            world.self_orientation,
-            world.self_combat_state(),
-            world.self_action_flash,
-        );
     }
 
     // ── HUD pass ─────────────────────────────────────────────────────
