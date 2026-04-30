@@ -94,6 +94,19 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
     // freshly-issued *session* id, then unhid them on the next handoff
     // — is gone.
     for e in world.entities.values() {
+        // Skip entities whose position hasn't been confirmed by an
+        // EntityMoved (or StateAck for self) yet. Health / state
+        // events can land before the first move on a freshly
+        // re-broadcast set of entities (the destination shard's
+        // first batch after handoff isn't guaranteed to put Move
+        // strictly first), and rendering the default (0, 0, 0)
+        // would flash the entity off-screen for a frame — the
+        // visible "bots disappear and reappear during handoff"
+        // effect, since the user is rarely standing at the world
+        // origin.
+        if !e.has_position {
+            continue;
+        }
         if e.is_self {
             if world.session_open {
                 // The local player's combat_state and position come from

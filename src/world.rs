@@ -47,6 +47,20 @@ pub struct Entity {
     /// circles; pruning skips self so a few hundred milliseconds without
     /// a `StateAck` (handoff window) doesn't wipe the camera target.
     pub is_self: bool,
+    /// True once we've received an `EntityMoved` (or `StateAck` for
+    /// self) that placed this entity at a real world position. Other
+    /// updates (`EntityHealth`, `EntityStateChanged`, `HitConfirm`)
+    /// can arrive before the first move on a fresh shard — for a
+    /// reconnect after handoff, the destination's first batch may
+    /// emit Health or State for an entity in a different order than
+    /// Move, causing a one-frame flash at (0, 0, 0) which the user
+    /// observes as the "bots disappear and reappear during handoff"
+    /// glitch (the flash is off-screen if you're not at the world
+    /// origin). The renderer skips entities whose position is not
+    /// yet set; the missed Health/State update gets stamped onto the
+    /// entity once the position update lands and any subsequent
+    /// Health/State delta from the server.
+    pub has_position: bool,
 }
 
 impl Entity {
@@ -63,6 +77,7 @@ impl Entity {
             combat_param: 0,
             last_seen: Instant::now(),
             is_self: false,
+            has_position: false,
         }
     }
 
@@ -243,6 +258,7 @@ impl World {
                     e.hp = hp;
                     e.max_hp = e.max_hp.max(hp).max(1);
                     e.last_seen = Instant::now();
+                    e.has_position = true;
                 }
             }
 
@@ -279,6 +295,7 @@ impl World {
                 e.z = z + self.origin_z as f32;
                 e.orientation = orientation;
                 e.last_seen = Instant::now();
+                e.has_position = true;
             }
 
             NetEvent::EntityHealth {
