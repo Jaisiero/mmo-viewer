@@ -26,7 +26,9 @@ use crate::channels::NetEvent;
 /// — disappears at the source.
 #[derive(Debug, Clone)]
 pub struct Entity {
-    pub id: u32,
+    // Note: the entity_id is the `entities: HashMap<u32, _>` key —
+    // we don't carry it as a struct field. The previous `pub id:
+    // u32` was only read by a since-removed render filter.
     /// World-space X (cross-shard coord, i.e. origin-relative).
     pub x: f32,
     pub y: f32,
@@ -74,9 +76,8 @@ pub struct Entity {
 }
 
 impl Entity {
-    fn new(id: u32) -> Self {
+    fn new() -> Self {
         Self {
-            id,
             x: 0.0,
             y: 0.0,
             z: 0.0,
@@ -291,7 +292,7 @@ impl World {
                 if self.persistent_id != 0 {
                     let e = self.entities
                         .entry(self.persistent_id)
-                        .or_insert_with(|| Entity::new(self.persistent_id));
+                        .or_insert_with(|| Entity::new());
                     e.is_self = true;
                     e.x = world_x as f32;
                     e.y = world_y as f32;
@@ -325,7 +326,7 @@ impl World {
                 let e = self
                     .entities
                     .entry(entity_id)
-                    .or_insert_with(|| Entity::new(entity_id));
+                    .or_insert_with(|| Entity::new());
                 // Wire-to-world transform: see the StateAck branch.
                 // Entity fields are f32 (render-friendly); origin is
                 // f64 (matches the wire / session). Cast happens here
@@ -374,7 +375,7 @@ impl World {
                 let e = self
                     .entities
                     .entry(entity_id)
-                    .or_insert_with(|| Entity::new(entity_id));
+                    .or_insert_with(|| Entity::new());
                 e.hp = hp;
                 e.max_hp = max_hp.max(1);
                 e.last_seen = Instant::now();
@@ -388,7 +389,7 @@ impl World {
                 let e = self
                     .entities
                     .entry(entity_id)
-                    .or_insert_with(|| Entity::new(entity_id));
+                    .or_insert_with(|| Entity::new());
                 e.combat_state = state_id;
                 e.combat_param = param_a;
                 e.last_seen = Instant::now();
@@ -487,19 +488,6 @@ impl World {
         }
         let elapsed = e.last_seen.elapsed().as_secs_f32().min(MAX_PREDICTION_SECS);
         (e.x + e.vx * elapsed, e.z + e.vz * elapsed)
-    }
-
-    pub fn self_combat_state(&self) -> u16 {
-        // Look up the local player's `is_self` record (keyed by
-        // `persistent_id`, not the per-shard `player_id`). The previous
-        // version keyed on `self.player_id` and silently returned 0
-        // because `entities` is keyed on `entity_id` (persistent_id) —
-        // session ids and persistent ids are different namespaces and
-        // collide only by accident.
-        self.entities
-            .get(&self.persistent_id)
-            .map(|e| e.combat_state)
-            .unwrap_or(0)
     }
 
     /// Drop entities we haven't heard from in `stale_secs`. Called every
