@@ -135,6 +135,22 @@ pub struct World {
     /// loop's convenience; the renderer reads from the entity record.
     pub self_action_flash: Option<(u8, Instant)>,
 
+    /// Last input intent from the local user (`move_x`, `move_z`),
+    /// updated every frame from `InputState` before the GuiCmd is
+    /// emitted. Used by the handoff dead-reckoning path so the camera
+    /// keeps panning during the ~25 ms reconnect window — without
+    /// this the user sees their own character "freeze" mid-step
+    /// every time they cross a shard boundary.
+    pub last_input_x: f32,
+    pub last_input_z: f32,
+
+    /// `Some(t)` while a shard handoff is in flight (between
+    /// `HandoffStarted` and the next `SessionOpened` /
+    /// post-handoff `StateAck`). Carries the moment the handoff
+    /// began so the renderer can extrapolate the local player's
+    /// position by `last_input * PLAYER_SPEED * elapsed`.
+    pub handoff_predicting_since: Option<Instant>,
+
     pub entities: HashMap<u32, Entity>,
 }
 
@@ -159,6 +175,9 @@ impl Default for World {
             last_rejection: None,
             self_orientation: 0.0,
             self_action_flash: None,
+            last_input_x: 0.0,
+            last_input_z: 0.0,
+            handoff_predicting_since: None,
             entities: HashMap::new(),
         }
     }
@@ -230,6 +249,16 @@ impl World {
                 self.self_z = world_z;
                 self.self_hp = hp;
                 self.self_stamina = stamina;
+
+                // First StateAck after a handoff ends the dead-
+                // reckoning window: snap the camera target back to
+                // the authoritative server position. With the
+                // server-side position-extrapolation fix in place
+                // (`pos += vel * elapsed` in mmo-shard's
+                // on_player_join), the snap distance is sub-metre
+                // even at full PLAYER_SPEED, so the visual jolt is
+                // imperceptible.
+                self.handoff_predicting_since = None;
 
                 // Mirror the local player into the unified `entities`
                 // store keyed by `persistent_id`. This is the change
@@ -355,6 +384,15 @@ impl World {
                 self.status = String::from("disconnected");
             }
 
+            NetEvent::HandoffStarted => {
+                // Enter dead-reckoning for the local player. The
+                // renderer will extrapolate `self_x/self_z` by
+                // `last_input * PLAYER_SPEED * elapsed` until the
+                // next StateAck arrives — typically 15-30 ms — so
+                // the camera doesn't visibly freeze mid-step.
+                self.handoff_predicting_since = Some(Instant::now());
+            }
+
             NetEvent::RttSample(ms) => self.rtt_ms = ms,
         }
     }
@@ -364,6 +402,33 @@ impl World {
     /// out of the raw `self_*` fields so we only have one source of
     /// truth: the entities map, which is what the renderer already
     /// iterates for neighbours.
+    /// Local player position to render with: the authoritative
+    /// `self_x/self_z` outside a handoff window, or a dead-reckoned
+    /// extrapolation while `handoff_predicting_since` is live.
+    ///
+    /// The extrapolation uses `last_input_*` (the raw key intent
+    /// captured by `input::poll`) at `PLAYER_SPEED = 5.0`, which is
+    /// what the server applies for inputs that pass dedup. It's
+    /// purely a visual smoothing — the StateAck on the new shard
+    /// snaps the value back to the authoritative position the
+    /// moment it arrives. Capped at 200 ms so a stalled handoff
+    /// (network partition, rare) doesn't fling the camera off
+    /// across the world.
+    pub fn predicted_self_pos(&self) -> (f64, f64) {
+        const MAX_PREDICTION_SECS: f64 = 0.2;
+        // Server-side PLAYER_SPEED in m/s. Has to match
+        // `mmo-shard::player::PLAYER_SPEED` so the dead-reckoned
+        // motion looks like the post-handoff first ack.
+        const PLAYER_SPEED: f64 = 5.0;
+        let Some(since) = self.handoff_predicting_since else {
+            return (self.self_x, self.self_z);
+        };
+        let elapsed = since.elapsed().as_secs_f64().min(MAX_PREDICTION_SECS);
+        let dx = self.last_input_x as f64 * PLAYER_SPEED * elapsed;
+        let dz = self.last_input_z as f64 * PLAYER_SPEED * elapsed;
+        (self.self_x + dx, self.self_z + dz)
+    }
+
     pub fn self_combat_state(&self) -> u16 {
         // Look up the local player's `is_self` record (keyed by
         // `persistent_id`, not the per-shard `player_id`). The previous

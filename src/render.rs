@@ -64,8 +64,14 @@ const GRID_AXIS_COLOUR: Color = Color::new(0.25, 0.25, 0.30, 1.0);
 pub fn draw(world: &World, cfg: &ViewerConfig) {
     clear_background(Color::new(0.05, 0.05, 0.07, 1.0));
 
-    let self_x = world.self_x as f32;
-    let self_z = world.self_z as f32;
+    // During the brief handoff window the server's StateAck stops
+    // arriving for ~15-30 ms. `predicted_self_pos` returns the
+    // authoritative `self_x/self_z` outside that window and a
+    // dead-reckoned extrapolation while it's open, so the camera
+    // doesn't visibly freeze mid-step.
+    let (self_world_x, self_world_z) = world.predicted_self_pos();
+    let self_x = self_world_x as f32;
+    let self_z = self_world_z as f32;
 
     // ── World-space camera ───────────────────────────────────────────
     // Zoom expresses world → NDC: a world length of `range` maps to 2
@@ -109,14 +115,14 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
         }
         if e.is_self {
             if world.session_open {
-                // The local player's combat_state and position come from
-                // the same entity record. orientation + action_flash are
-                // local-only (driven by the input loop) and stay on
-                // World — there's no wire path that would carry them
-                // back to us anyway.
+                // Use the dead-reckoned position (same as the camera
+                // target) so the triangle and the camera stay locked
+                // together during the ~25 ms handoff window. Outside
+                // that window `self_x/self_z` are the same as
+                // `e.x/e.z` (both updated by the same StateAck).
                 draw_self(
-                    e.x,
-                    e.z,
+                    self_x,
+                    self_z,
                     world.self_orientation,
                     e.combat_state,
                     world.self_action_flash,

@@ -88,6 +88,16 @@ pub enum NetEvent {
     /// UDP channel closed by the shard.
     Disconnected,
 
+    /// The net thread is mid-handoff: the old `GameClient` is being
+    /// torn down and a new one is about to authenticate against the
+    /// destination shard. Emitted once per handoff, just before
+    /// `client.stop()`. The world uses this to enter a short
+    /// dead-reckoning window for the local player (camera + self
+    /// position) so the user doesn't see a perceptible freeze
+    /// during the ~15-30 ms reconnect gap. The next `SessionOpened`
+    /// or first post-handoff `StateAck` clears the prediction.
+    HandoffStarted,
+
     /// Viewer-internal: round-trip time sample in milliseconds.
     RttSample(u32),
 }

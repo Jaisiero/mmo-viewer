@@ -479,6 +479,13 @@ async fn do_handoff(
         "⟳ Handoff → shard 0x{:X} at {}:{}",
         new_shard_id, new_ip, new_port
     )));
+    // Tell the renderer to enter dead-reckoning for the local
+    // player. The next ~15-30 ms have no StateAck arriving (we're
+    // tearing the old session down + opening the new one), and
+    // without prediction the camera + self triangle visibly
+    // freeze mid-step right when the user is mid-cross. The next
+    // post-handoff StateAck clears the flag.
+    let _ = net_events.send(NetEvent::HandoffStarted);
 
     client.stop();
     *client = GameClient::new(&cfg.client);

@@ -92,6 +92,17 @@ async fn main() {
         //    visible combat_state (jump, dodge).
         let cmds = input::poll(&mut input_state);
         world.self_orientation = input_state.orientation;
+        // Mirror the latest movement intent to the world so the
+        // dead-reckoning path during shard handoffs (see
+        // `World::predicted_self_pos`) extrapolates with the keys
+        // the user is actually holding right now, not a stale
+        // pre-handoff value.
+        for cmd in &cmds {
+            if let GuiCmd::Move { move_x, move_z, .. } = cmd {
+                world.last_input_x = *move_x;
+                world.last_input_z = *move_z;
+            }
+        }
         for cmd in cmds {
             // Capture action code + timestamp before the Move, so an
             // Action emitted on the same frame still reaches the world
