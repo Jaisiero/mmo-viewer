@@ -129,7 +129,13 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
                 );
             }
         } else {
-            draw_entity(e);
+            // During the handoff window, dead-reckon the ghost too
+            // so remote bots don't visibly freeze for ~25 ms while
+            // the local UDP session swaps shards. `predicted_entity_pos`
+            // is identity outside the window — debugger philosophy
+            // is preserved for normal frames.
+            let (px, pz) = world.predicted_entity_pos(e);
+            draw_entity(e, px, pz);
         }
     }
 
@@ -175,12 +181,16 @@ fn draw_grid(cx: f32, cz: f32, range_x: f32, range_y: f32) {
 
 /// Draw a neighbour entity: a filled circle whose colour is derived
 /// from hp (green→red) and whose outline is tinted by combat_state.
-fn draw_entity(e: &Entity) {
+///
+/// `x` / `z` are passed explicitly so the caller can substitute a
+/// dead-reckoned position during the handoff window. Outside the
+/// window they're just `e.x` / `e.z`.
+fn draw_entity(e: &Entity, x: f32, z: f32) {
     const R: f32 = 0.8;
     // HP-fraction lerp from red to green.
     let hp = e.hp_frac();
     let body = Color::new(1.0 - hp, hp, 0.2, 1.0);
-    draw_circle(e.x, e.z, R, body);
+    draw_circle(x, z, R, body);
 
     // Outline colour = combat state tint. State id 0 is "idle" in mmo
     // shard conventions; anything non-zero gets a yellow halo so state
@@ -190,12 +200,12 @@ fn draw_entity(e: &Entity) {
     } else {
         Color::new(1.0, 0.9, 0.2, 1.0)
     };
-    draw_circle_lines(e.x, e.z, R, 0.08, outline);
+    draw_circle_lines(x, z, R, 0.08, outline);
 
     // Orientation tick: short line from centre in the facing direction.
-    let tx = e.x + e.orientation.cos() * (R * 1.4);
-    let tz = e.z + e.orientation.sin() * (R * 1.4);
-    draw_line(e.x, e.z, tx, tz, 0.10, WHITE);
+    let tx = x + e.orientation.cos() * (R * 1.4);
+    let tz = z + e.orientation.sin() * (R * 1.4);
+    draw_line(x, z, tx, tz, 0.10, WHITE);
 }
 
 /// Draw the player as a triangle with its apex in the facing direction.

@@ -61,6 +61,16 @@ pub struct Entity {
     /// entity once the position update lands and any subsequent
     /// Health/State delta from the server.
     pub has_position: bool,
+    /// Estimated linear velocity in world units per second, derived
+    /// from the (pos, time) delta between consecutive `EntityMoved`
+    /// events. Used by the handoff dead-reckoning path to keep
+    /// remote entities moving smoothly through the ~25 ms window
+    /// where the server stops broadcasting (old shard's UDP socket
+    /// down + new shard not yet sending). Outside the window the
+    /// renderer uses raw `x/z` so the debugger philosophy of
+    /// "no smoothing" still applies to normal frames.
+    pub vx: f32,
+    pub vz: f32,
 }
 
 impl Entity {
@@ -78,6 +88,8 @@ impl Entity {
             last_seen: Instant::now(),
             is_self: false,
             has_position: false,
+            vx: 0.0,
+            vz: 0.0,
         }
     }
 
@@ -319,11 +331,38 @@ impl World {
                 // f64 (matches the wire / session). Cast happens here
                 // once per update; precision loss is irrelevant at the
                 // sub-metre scale we render.
-                e.x = x + self.origin_x as f32;
+                let new_x = x + self.origin_x as f32;
+                let new_z = z + self.origin_z as f32;
+                let now = Instant::now();
+                // Estimate velocity from (Δposition / Δt) between
+                // consecutive moves. Used purely as the input to the
+                // handoff dead-reckoning path so remote entities don't
+                // visibly freeze for ~25 ms while the local UDP
+                // session swaps shards. EWMA-smoothed (α = 0.5) so a
+                // single jittery sample doesn't fling the prediction.
+                // Only meaningful once the entity already had a real
+                // position; the first EntityMove after spawn produces
+                // garbage velocity that gets weighted in.
+                if e.has_position {
+                    let dt = now.duration_since(e.last_seen).as_secs_f32().max(0.001);
+                    // Cap dt: an entity that's been silent for >500 ms
+                    // (out of AOI, then back) shouldn't poison the
+                    // velocity estimate with the giant delta.
+                    if dt < 0.5 {
+                        let inst_vx = (new_x - e.x) / dt;
+                        let inst_vz = (new_z - e.z) / dt;
+                        e.vx = 0.5 * e.vx + 0.5 * inst_vx;
+                        e.vz = 0.5 * e.vz + 0.5 * inst_vz;
+                    } else {
+                        e.vx = 0.0;
+                        e.vz = 0.0;
+                    }
+                }
+                e.x = new_x;
                 e.y = y;
-                e.z = z + self.origin_z as f32;
+                e.z = new_z;
                 e.orientation = orientation;
-                e.last_seen = Instant::now();
+                e.last_seen = now;
                 e.has_position = true;
             }
 
@@ -427,6 +466,27 @@ impl World {
         let dx = self.last_input_x as f64 * PLAYER_SPEED * elapsed;
         let dz = self.last_input_z as f64 * PLAYER_SPEED * elapsed;
         (self.self_x + dx, self.self_z + dz)
+    }
+
+    /// Position to render an entity at. During the handoff window
+    /// extrapolates by `entity.vx/vz * elapsed_since_last_seen` so
+    /// remote bots keep moving smoothly through the ~25 ms gap
+    /// where neither the source nor the destination shard is
+    /// broadcasting EntityMove events. Outside the window returns
+    /// the raw last-known position — debugger philosophy preserved
+    /// for normal frames.
+    ///
+    /// Capped at 200 ms of extrapolation so a stalled handoff
+    /// doesn't fling ghosts off across the world. Stationary bots
+    /// have `vx = vz ≈ 0` (the EWMA from `EntityMoved` deltas), so
+    /// they stay still as expected.
+    pub fn predicted_entity_pos(&self, e: &Entity) -> (f32, f32) {
+        const MAX_PREDICTION_SECS: f32 = 0.2;
+        if self.handoff_predicting_since.is_none() {
+            return (e.x, e.z);
+        }
+        let elapsed = e.last_seen.elapsed().as_secs_f32().min(MAX_PREDICTION_SECS);
+        (e.x + e.vx * elapsed, e.z + e.vz * elapsed)
     }
 
     pub fn self_combat_state(&self) -> u16 {
