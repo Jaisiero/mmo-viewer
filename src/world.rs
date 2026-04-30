@@ -63,16 +63,6 @@ pub struct Entity {
     /// entity once the position update lands and any subsequent
     /// Health/State delta from the server.
     pub has_position: bool,
-    /// Estimated linear velocity in world units per second, derived
-    /// from the (pos, time) delta between consecutive `EntityMoved`
-    /// events. Used by the handoff dead-reckoning path to keep
-    /// remote entities moving smoothly through the ~25 ms window
-    /// where the server stops broadcasting (old shard's UDP socket
-    /// down + new shard not yet sending). Outside the window the
-    /// renderer uses raw `x/z` so the debugger philosophy of
-    /// "no smoothing" still applies to normal frames.
-    pub vx: f32,
-    pub vz: f32,
 }
 
 impl Entity {
@@ -89,8 +79,6 @@ impl Entity {
             last_seen: Instant::now(),
             is_self: false,
             has_position: false,
-            vx: 0.0,
-            vz: 0.0,
         }
     }
 
@@ -332,38 +320,11 @@ impl World {
                 // f64 (matches the wire / session). Cast happens here
                 // once per update; precision loss is irrelevant at the
                 // sub-metre scale we render.
-                let new_x = x + self.origin_x as f32;
-                let new_z = z + self.origin_z as f32;
-                let now = Instant::now();
-                // Estimate velocity from (Δposition / Δt) between
-                // consecutive moves. Used purely as the input to the
-                // handoff dead-reckoning path so remote entities don't
-                // visibly freeze for ~25 ms while the local UDP
-                // session swaps shards. EWMA-smoothed (α = 0.5) so a
-                // single jittery sample doesn't fling the prediction.
-                // Only meaningful once the entity already had a real
-                // position; the first EntityMove after spawn produces
-                // garbage velocity that gets weighted in.
-                if e.has_position {
-                    let dt = now.duration_since(e.last_seen).as_secs_f32().max(0.001);
-                    // Cap dt: an entity that's been silent for >500 ms
-                    // (out of AOI, then back) shouldn't poison the
-                    // velocity estimate with the giant delta.
-                    if dt < 0.5 {
-                        let inst_vx = (new_x - e.x) / dt;
-                        let inst_vz = (new_z - e.z) / dt;
-                        e.vx = 0.5 * e.vx + 0.5 * inst_vx;
-                        e.vz = 0.5 * e.vz + 0.5 * inst_vz;
-                    } else {
-                        e.vx = 0.0;
-                        e.vz = 0.0;
-                    }
-                }
-                e.x = new_x;
+                e.x = x + self.origin_x as f32;
                 e.y = y;
-                e.z = new_z;
+                e.z = z + self.origin_z as f32;
                 e.orientation = orientation;
-                e.last_seen = now;
+                e.last_seen = Instant::now();
                 e.has_position = true;
             }
 
@@ -469,25 +430,39 @@ impl World {
         (self.self_x + dx, self.self_z + dz)
     }
 
-    /// Position to render an entity at. During the handoff window
-    /// extrapolates by `entity.vx/vz * elapsed_since_last_seen` so
-    /// remote bots keep moving smoothly through the ~25 ms gap
-    /// where neither the source nor the destination shard is
-    /// broadcasting EntityMove events. Outside the window returns
-    /// the raw last-known position — debugger philosophy preserved
-    /// for normal frames.
+    /// Position to render an entity at — currently identity, just
+    /// returns the entity's authoritative `(x, z)` from the latest
+    /// EntityMoved.
     ///
-    /// Capped at 200 ms of extrapolation so a stalled handoff
-    /// doesn't fling ghosts off across the world. Stationary bots
-    /// have `vx = vz ≈ 0` (the EWMA from `EntityMoved` deltas), so
-    /// they stay still as expected.
+    /// The previous version dead-reckoned ghosts during the handoff
+    /// window using a velocity estimated from position deltas, but
+    /// the estimate was inherently noisy: it conflated direction
+    /// changes (a bot turning right just before the gap predicted
+    /// straight on, then snap-corrected when the dest's first
+    /// broadcast arrived), ghost↔real role switches (the same bot
+    /// moving from "ghost replicated from neighbour" to "real on
+    /// the new shard" reset the velocity continuity), and ghost-
+    /// stream jitter. Different bots ended up with different
+    /// prediction quality during the same handoff — visible as
+    /// "inconsistencia de players y ghosts" reported by the user.
+    ///
+    /// Local-player dead-reckoning (`predicted_self_pos`) doesn't
+    /// have this problem because it uses the user's *input* keys
+    /// directly at PLAYER_SPEED, which matches what the server
+    /// actually applied — it's deterministic, not estimated. So
+    /// that path stays.
+    ///
+    /// Net effect: ghosts visibly freeze for ~25 ms during the
+    /// handoff window. Uniform freeze across all bots is a less
+    /// jarring artefact than per-bot misprediction, and the local
+    /// player keeps panning smoothly so the world doesn't feel
+    /// stuck. If the freeze becomes the dominant complaint we can
+    /// add a snap-smoothing layer that lerps toward the
+    /// authoritative position over a few frames after each
+    /// EntityMoved — that path doesn't predict forward, only
+    /// smooths discontinuities, so it can't go off-direction.
     pub fn predicted_entity_pos(&self, e: &Entity) -> (f32, f32) {
-        const MAX_PREDICTION_SECS: f32 = 0.2;
-        if self.handoff_predicting_since.is_none() {
-            return (e.x, e.z);
-        }
-        let elapsed = e.last_seen.elapsed().as_secs_f32().min(MAX_PREDICTION_SECS);
-        (e.x + e.vx * elapsed, e.z + e.vz * elapsed)
+        (e.x, e.z)
     }
 
     /// Drop entities we haven't heard from in `stale_secs`. Called every
