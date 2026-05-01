@@ -16,6 +16,8 @@
 //! a 250 ms grace period on a bare `Disconnected` to catch a late
 //! handoff message — same trick the CLI uses.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use mmo_cli::auth_client::AuthServiceClient;
@@ -452,15 +454,93 @@ fn map_event(ev: GameEvent) -> Option<NetEvent> {
 
 // ── Handoff / gateway-retry helpers ───────────────────────────────────────
 
-/// Tear down the current `GameClient` and reconnect to `new_ip:new_port`
-/// using `HandoffAuth`. On success, publishes a fresh `SessionOpened`
-/// so the renderer can switch its camera/HUD to the new shard.
+/// Spawn a tokio task that drains `old_client.poll_events()` at a small
+/// interval and forwards "still useful" events (everything except the
+/// local player's `StateAck` and the lifecycle events the main loop
+/// already handles) to the renderer. Used during handoff so remote
+/// entities (bots, ghosts) keep receiving updates from the *old* shard
+/// while the new shard is still authenticating — the dual-socket path
+/// the user asked for in place of the freeze-then-snap window.
+///
+/// Returns a `(stop_flag, JoinHandle)` pair: set the flag to `true` and
+/// `await` the handle to gracefully drain remaining events from the
+/// old client and shut it down.
+///
+/// `StateAck` is filtered out because the local player's old position
+/// is the freeze point — it's already stale by the moment SHARD_HANDOFF
+/// arrived; the dead-reckoning path keeps the camera moving while the
+/// new shard's first StateAck takes over as the authoritative source.
+fn spawn_old_client_drain(
+    mut old_client: GameClient,
+    net_events: crossbeam_channel::Sender<NetEvent>,
+) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop.clone();
+    let handle = tokio::spawn(async move {
+        // Tight enough to capture the next 4 ms tick from the old shard
+        // (server is at 120 Hz = ~8 ms, we sample at ~250 Hz so we
+        // never miss a broadcast); not so tight we burn the CPU
+        // during the typically <30 ms handoff window.
+        let mut interval = tokio::time::interval(Duration::from_millis(2));
+        while !stop_flag.load(Ordering::Relaxed) {
+            interval.tick().await;
+            for ev in old_client.poll_events() {
+                // Lifecycle events are owned by the main loop's handoff
+                // logic, not by this bridge.
+                if matches!(
+                    ev,
+                    GameEvent::Disconnected | GameEvent::ShardHandoffReceived { .. }
+                ) {
+                    continue;
+                }
+                // Skip self-state from the old shard: the player is
+                // mid-handoff, frozen on this side, so the StateAck
+                // values are stale. Dead-reckoning + the new shard's
+                // first StateAck take over the local player.
+                if matches!(ev, GameEvent::StateAck { .. }) {
+                    continue;
+                }
+                if let Some(mapped) = map_event(ev) {
+                    if net_events.send(mapped).is_err() {
+                        // Renderer gone — stop draining.
+                        break;
+                    }
+                }
+            }
+        }
+        // One last drain on shutdown so we don't lose a final batch.
+        for ev in old_client.poll_events() {
+            if matches!(
+                ev,
+                GameEvent::Disconnected
+                    | GameEvent::ShardHandoffReceived { .. }
+                    | GameEvent::StateAck { .. }
+            ) {
+                continue;
+            }
+            if let Some(mapped) = map_event(ev) {
+                let _ = net_events.send(mapped);
+            }
+        }
+        old_client.stop();
+    });
+    (stop, handle)
+}
+
+/// Hand off the current `GameClient` to a new shard at `new_ip:new_port`
+/// using `HandoffAuth`, **maintaining both UDP sessions in parallel
+/// during the reconnect window** so remote entities never lose their
+/// update stream. The old session keeps broadcasting bots / ghosts
+/// from the source shard while the new session authenticates; once the
+/// new session reports `SessionOpened` we stop the old drain and
+/// publish the new origin to the renderer.
 ///
 /// Returns `false` if the viewer should exit the hot loop (terminal
 /// failure or renderer-gone). On `AuthError::ShardDraining` from the
 /// target — which happens when the absorber shard re-splits before
 /// our packet lands — we bounce through the gateway with `last_pos`
-/// instead of giving up.
+/// instead of giving up; the old drain stays alive across that
+/// gateway round-trip too.
 #[allow(clippy::too_many_arguments)]
 async fn do_handoff(
     client: &mut GameClient,
@@ -480,16 +560,33 @@ async fn do_handoff(
         new_shard_id, new_ip, new_port
     )));
     // Tell the renderer to enter dead-reckoning for the local
-    // player. The next ~15-30 ms have no StateAck arriving (we're
-    // tearing the old session down + opening the new one), and
-    // without prediction the camera + self triangle visibly
-    // freeze mid-step right when the user is mid-cross. The next
-    // post-handoff StateAck clears the flag.
+    // player. The new shard's first StateAck clears the flag.
     let _ = net_events.send(NetEvent::HandoffStarted);
 
-    client.stop();
-    *client = GameClient::new(&cfg.client);
+    // ── Dual-socket path ───────────────────────────────────────────
+    // Move ownership of the old GameClient into a background drain
+    // task that keeps polling its events and forwarding remote-entity
+    // updates while we authenticate the new connection. The old
+    // shard's broadcasts continue to flow (source still treats our
+    // session as HandoffPending, not closed), so bots near the
+    // boundary keep updating without the previous ~25 ms freeze.
+    //
+    // We replace `*client` with a fresh GameClient here so the
+    // outer hot loop's `client.poll_events()` call after we return
+    // already targets the new shard.
+    let old_client = std::mem::replace(client, GameClient::new(&cfg.client));
     client.set_jwt(jwt);
+    let (old_drain_stop, old_drain_handle) =
+        spawn_old_client_drain(old_client, net_events.clone());
+
+    // Helper to gracefully shut down the old drain on exit.
+    async fn shutdown_old_drain(
+        stop: Arc<AtomicBool>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.await;
+    }
 
     let connect_res = client
         .connect_with_handoff_auth(new_ip, new_port, persistent_id, handoff_token)
@@ -497,11 +594,17 @@ async fn do_handoff(
     if let Err(e) = connect_res {
         let _ = net_events.send(NetEvent::Status(format!("✗ Handoff connect failed: {e}")));
         let _ = net_events.send(NetEvent::Disconnected);
+        shutdown_old_drain(old_drain_stop, old_drain_handle).await;
         return false;
     }
 
     match client.wait_for_session_open().await {
         Ok(()) => {
+            // New shard is alive. Stop bridging from the old socket —
+            // its data is now stale relative to the authoritative
+            // source. Drain handle joins quickly because the loop
+            // checks the stop flag every interval tick (≤ 2 ms).
+            shutdown_old_drain(old_drain_stop, old_drain_handle).await;
             publish_session_opened(client, net_events);
             true
         }
@@ -509,13 +612,21 @@ async fn do_handoff(
             // Target shard is itself draining — typically because a
             // merge absorber split again, or the orchestrator picked
             // an already-overloaded shard. Re-ask the gateway with the
-            // last known world position. Same fallback `mmo-cli` runs
-            // (gameplay.rs:765-772 → RetryViaGateway).
-            retry_via_gateway(client, cfg, jwt, gateway, last_pos, net_events).await
+            // last known world position. Old drain stays alive across
+            // the gateway round-trip too — same dual-socket benefit
+            // applies: bots keep updating from the source shard while
+            // the gateway re-routes us.
+            let result = retry_via_gateway(
+                client, cfg, jwt, gateway, last_pos, net_events,
+            )
+            .await;
+            shutdown_old_drain(old_drain_stop, old_drain_handle).await;
+            result
         }
         Err(AuthError::Other(e)) => {
             let _ = net_events.send(NetEvent::Status(format!("✗ Handoff auth failed: {e}")));
             let _ = net_events.send(NetEvent::Disconnected);
+            shutdown_old_drain(old_drain_stop, old_drain_handle).await;
             false
         }
     }
