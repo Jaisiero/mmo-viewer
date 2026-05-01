@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use macroquad::prelude::*;
 
-use crate::config::ViewerConfig;
+use crate::boundaries::{shard_colour, SharedRegions};
 use crate::world::{Entity, World};
 
 // Combat state id → body colour for the self triangle. Values match
@@ -58,10 +58,22 @@ const GRID_STEP: f32 = 10.0;
 /// units). Slightly brighter — a rough "you are here" anchor.
 const GRID_AXIS_COLOUR: Color = Color::new(0.25, 0.25, 0.30, 1.0);
 
-/// Draw one frame. `cfg.view_range` controls the world-space width
-/// covered by the shorter screen dimension; the longer dimension gets
-/// proportionally more world visible.
-pub fn draw(world: &World, cfg: &ViewerConfig) {
+/// Draw one frame. `view_range` is the world-space width covered by
+/// the shorter screen dimension; the longer dimension gets
+/// proportionally more world visible. The viewer's input layer owns
+/// the live value (mouse wheel / `+` / `-` / `0` mutate it), so the
+/// renderer takes it explicitly rather than reading the loaded
+/// configured value out of `ViewerConfig`.
+///
+/// `regions` is the shared snapshot of shard rectangles refreshed
+/// every few seconds by the boundary-overlay polling task; drawn
+/// when `show_boundaries` is on.
+pub fn draw(
+    world: &World,
+    view_range: f32,
+    regions: &SharedRegions,
+    show_boundaries: bool,
+) {
     clear_background(Color::new(0.05, 0.05, 0.07, 1.0));
 
     // During the brief handoff window the server's StateAck stops
@@ -82,8 +94,8 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
     // first version of this file had that sign inverted and W/S moved
     // the grid the wrong way; don't "fix" it back.
     let aspect = screen_width() / screen_height().max(1.0);
-    let range_x = cfg.view_range * aspect;
-    let range_y = cfg.view_range;
+    let range_x = view_range * aspect;
+    let range_y = view_range;
     let camera = Camera2D {
         target: vec2(self_x, self_z),
         zoom: vec2(2.0 / range_x, -2.0 / range_y),
@@ -92,6 +104,9 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
     set_camera(&camera);
 
     draw_grid(self_x, self_z, range_x, range_y);
+    if show_boundaries {
+        draw_shard_boundaries(regions, view_range);
+    }
     // Single iteration over the unified entity store. The local player
     // lives in here too (with `is_self = true`, keyed by
     // `persistent_id`), so handoff transitions don't drop+recreate any
@@ -141,7 +156,43 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
 
     // ── HUD pass ─────────────────────────────────────────────────────
     set_default_camera();
-    draw_hud(world, cfg);
+    draw_hud(world, view_range);
+}
+
+/// Render each shard region as a rectangle outline in world-space.
+/// The line thickness is scaled inversely with `view_range` so the
+/// strokes look the same on screen at any zoom level.  Each shard
+/// gets a stable hue derived from its `shard_id`; a faint fill is
+/// painted inside the rectangle so over-zoomed views still
+/// communicate "you are inside shard X".
+fn draw_shard_boundaries(regions: &SharedRegions, view_range: f32) {
+    // RwLock read failure (poisoned) means the writer panicked — nothing
+    // sane to do but skip this frame's overlay; the next refresh will
+    // either succeed or stay empty.
+    let snapshot = match regions.read() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if snapshot.is_empty() {
+        return;
+    }
+    // Scale the stroke so it's ~2 logical pixels wide regardless of
+    // the camera's current zoom. The macroquad camera maps `range_y`
+    // world units to the window height, so 1 px ≈ range_y /
+    // screen_height world units.
+    let stroke = (view_range / screen_height().max(1.0)) * 2.0;
+    for r in snapshot.iter() {
+        let (cr, cg, cb) = shard_colour(&r.shard_id);
+        let outline_col = Color::new(cr, cg, cb, 0.85);
+        let fill_col    = Color::new(cr, cg, cb, 0.05);
+        let w = r.x_max - r.x_min;
+        let h = r.z_max - r.z_min;
+        // Faint tinted fill — useful when one shard's region is tiny
+        // and the outline alone is hard to spot.
+        draw_rectangle(r.x_min, r.z_min, w, h, fill_col);
+        // The outline is what the user actually reads.
+        draw_rectangle_lines(r.x_min, r.z_min, w, h, stroke, outline_col);
+    }
 }
 
 fn draw_grid(cx: f32, cz: f32, range_x: f32, range_y: f32) {
@@ -271,7 +322,7 @@ fn draw_self(
     }
 }
 
-fn draw_hud(world: &World, cfg: &ViewerConfig) {
+fn draw_hud(world: &World, view_range: f32) {
     const PAD: f32 = 8.0;
     const LINE: f32 = 18.0;
     const FONT: f32 = 16.0;
@@ -306,7 +357,7 @@ fn draw_hud(world: &World, cfg: &ViewerConfig) {
     let fps_line = format!(
         "fps {:>3}   view_range {:.0}",
         get_fps(),
-        cfg.view_range
+        view_range
     );
     let rejection_line = world
         .last_rejection

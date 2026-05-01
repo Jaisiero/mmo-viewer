@@ -26,6 +26,7 @@ use mmo_cli::gateway_client::GatewayClient;
 
 use tokio::runtime::Builder;
 
+use crate::boundaries::{self, SharedRegions};
 use crate::channels::{GuiCmd, NetChannels, NetEvent};
 use crate::config::ViewerConfig;
 
@@ -34,7 +35,11 @@ use crate::config::ViewerConfig;
 /// join handle is returned so `main` can wait for a clean shutdown after
 /// macroquad's window closes, but in practice we drop it and let the
 /// thread exit when its channels hang up.
-pub fn spawn(cfg: ViewerConfig, ch: NetChannels) -> std::thread::JoinHandle<()> {
+pub fn spawn(
+    cfg:     ViewerConfig,
+    ch:      NetChannels,
+    regions: SharedRegions,
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("mmo-viewer-net".into())
         .spawn(move || {
@@ -47,12 +52,19 @@ pub fn spawn(cfg: ViewerConfig, ch: NetChannels) -> std::thread::JoinHandle<()> 
                     return;
                 }
             };
-            rt.block_on(run(cfg, ch));
+            rt.block_on(run(cfg, ch, regions));
         })
         .expect("spawn mmo-viewer-net thread")
 }
 
-async fn run(cfg: ViewerConfig, ch: NetChannels) {
+async fn run(cfg: ViewerConfig, ch: NetChannels, regions: SharedRegions) {
+    // Boundary-overlay polling task lives on this same runtime: cheap
+    // gRPC every 3 s, no need to burn a second OS thread for it. If the
+    // URL is empty the user opted out and we just leave the snapshot
+    // empty (the renderer will draw nothing for the overlay).
+    if !cfg.world_coord_url.is_empty() {
+        boundaries::spawn(cfg.world_coord_url.clone(), regions);
+    }
     let NetChannels { net_events, gui_cmds } = ch;
     // Small helper to ship a status message without having to clone the
     // sender each time; we use it at every error path so the HUD never

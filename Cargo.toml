@@ -33,3 +33,12 @@ serde  = { version = "1", features = ["derive"] }
 # Logging.
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# gRPC client for world-coord (debug overlay: shard region rectangles).
+# Same versions as the rest of the workspace so the resolver picks one
+# tonic version across all crates.
+tonic = "0.12"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"

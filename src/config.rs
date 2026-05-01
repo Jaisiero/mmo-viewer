@@ -38,6 +38,14 @@ pub struct ViewerConfig {
     /// from the mirrored state. Needs to be larger than the shard's AOI
     /// broadcast period plus a small safety margin.
     pub stale_entity_secs: f32,
+
+    /// World-coord gRPC URL for the boundary-overlay debug feature.
+    /// Polled every few seconds for `ListShards`; the renderer draws
+    /// each shard's region rectangle when the overlay toggle (`B`) is
+    /// on.  Default points at the same host as the gateway, port
+    /// 8080 (world-coord's default).  Setting it to an empty string
+    /// disables the overlay entirely.
+    pub world_coord_url: String,
 }
 
 impl ViewerConfig {
@@ -55,6 +63,7 @@ impl ViewerConfig {
             .set_default("start_z", 0.0)?
             .set_default("view_range", 80.0)?
             .set_default("stale_entity_secs", 5.0)?
+            .set_default("world_coord_url", "http://127.0.0.1:8080")?
             .add_source(File::with_name("viewer").required(false))
             .add_source(Environment::with_prefix("VIEWER"))
             .build()?;

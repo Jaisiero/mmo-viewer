@@ -13,12 +13,20 @@
 //! No game logic lives here. Everything interesting happens server-side;
 //! the viewer exists to show you what the server actually sent.
 
+mod boundaries;
 mod channels;
 mod config;
 mod input;
 mod net;
 mod render;
 mod world;
+
+/// Re-export of the `tonic`-generated `world_coord` client.  Kept in
+/// its own module so the rest of the viewer doesn't deal with the
+/// `mmo.world_coord` proto-package mangling.
+pub mod world_coord_proto {
+    tonic::include_proto!("mmo.world_coord");
+}
 
 use std::time::Instant;
 
@@ -65,15 +73,24 @@ async fn main() {
         }
     };
 
+    // Boundary overlay: shared region snapshot owned by the net
+    // thread (it polls `WorldCoord/ListShards` on its own runtime).
+    // The render thread reads this once per frame; if the URL is
+    // empty (offline / no world-coord) the snapshot stays empty and
+    // the overlay draws nothing.
+    let regions = boundaries::make_shared_regions();
+
     // Spawn the tokio network thread. We don't keep the join handle:
     // the thread drops when both channels hang up, which happens when
     // we fall out of the main loop below (render thread drops
     // `gui_cmds`/`net_events`).
     let (gui, net) = channels::make_channels();
-    let _net_thread = net::spawn(cfg.clone(), net);
+    let _net_thread = net::spawn(cfg.clone(), net, regions.clone());
 
     let mut world = World::default();
-    let mut input_state = InputState::default();
+    // Seed the input layer with the configured `view_range`, which it
+    // then owns and mutates in response to zoom keys / mouse wheel.
+    let mut input_state = InputState::with_view_range(cfg.view_range);
 
     loop {
         // 1. Drain whatever the net thread produced since the last frame.
@@ -124,7 +141,12 @@ async fn main() {
 
         // 3. Render. Any NetEvents we missed this frame will be picked
         //    up next frame — there's no visible latency at 60 Hz.
-        render::draw(&world, &cfg);
+        render::draw(
+            &world,
+            input_state.view_range,
+            &regions,
+            input_state.show_boundaries,
+        );
 
         // Auth failures and action rejections stay visible in the HUD
         // rather than closing the window — the user can inspect and
