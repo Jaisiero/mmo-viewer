@@ -1019,8 +1019,11 @@ dependencies = [
  "crossbeam-channel",
  "macroquad",
  "mmo-cli",
+ "prost",
  "serde",
  "tokio",
+ "tonic",
+ "tonic-build",
  "tracing",
  "tracing-subscriber",
 ]
