@@ -16,7 +16,6 @@ use std::time::Instant;
 
 use macroquad::prelude::*;
 
-use crate::config::ViewerConfig;
 use crate::world::{Entity, World};
 
 // Combat state id → body colour for the self triangle. Values match
@@ -58,10 +57,13 @@ const GRID_STEP: f32 = 10.0;
 /// units). Slightly brighter — a rough "you are here" anchor.
 const GRID_AXIS_COLOUR: Color = Color::new(0.25, 0.25, 0.30, 1.0);
 
-/// Draw one frame. `cfg.view_range` controls the world-space width
-/// covered by the shorter screen dimension; the longer dimension gets
-/// proportionally more world visible.
-pub fn draw(world: &World, cfg: &ViewerConfig) {
+/// Draw one frame. `view_range` is the world-space width covered by
+/// the shorter screen dimension; the longer dimension gets
+/// proportionally more world visible. The viewer's input layer owns
+/// the live value (mouse wheel / `+` / `-` / `0` mutate it), so the
+/// renderer takes it explicitly rather than reading the loaded
+/// configured value out of `ViewerConfig`.
+pub fn draw(world: &World, view_range: f32) {
     clear_background(Color::new(0.05, 0.05, 0.07, 1.0));
 
     // During the brief handoff window the server's StateAck stops
@@ -82,8 +84,8 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
     // first version of this file had that sign inverted and W/S moved
     // the grid the wrong way; don't "fix" it back.
     let aspect = screen_width() / screen_height().max(1.0);
-    let range_x = cfg.view_range * aspect;
-    let range_y = cfg.view_range;
+    let range_x = view_range * aspect;
+    let range_y = view_range;
     let camera = Camera2D {
         target: vec2(self_x, self_z),
         zoom: vec2(2.0 / range_x, -2.0 / range_y),
@@ -141,7 +143,7 @@ pub fn draw(world: &World, cfg: &ViewerConfig) {
 
     // ── HUD pass ─────────────────────────────────────────────────────
     set_default_camera();
-    draw_hud(world, cfg);
+    draw_hud(world, view_range);
 }
 
 fn draw_grid(cx: f32, cz: f32, range_x: f32, range_y: f32) {
@@ -271,7 +273,7 @@ fn draw_self(
     }
 }
 
-fn draw_hud(world: &World, cfg: &ViewerConfig) {
+fn draw_hud(world: &World, view_range: f32) {
     const PAD: f32 = 8.0;
     const LINE: f32 = 18.0;
     const FONT: f32 = 16.0;
@@ -306,7 +308,7 @@ fn draw_hud(world: &World, cfg: &ViewerConfig) {
     let fps_line = format!(
         "fps {:>3}   view_range {:.0}",
         get_fps(),
-        cfg.view_range
+        view_range
     );
     let rejection_line = world
         .last_rejection

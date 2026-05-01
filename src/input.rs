@@ -12,6 +12,9 @@
 //!   J / K            — light / heavy attack (one-shot)
 //!   Space / F        — jump / dodge (one-shot)
 //!   L                — block (hold); emits RAISE on press, LOWER on release
+//!   + / -            — zoom in / out by 1.25× per press (clamped)
+//!   Mouse wheel      — smooth zoom (each notch = 1.1×)
+//!   0                — reset zoom to the configured `view_range`
 //!   Esc              — quit
 //!
 //! Action codes match the shard's enum: 1 light, 2 heavy, 3 jump, 4 dodge,
@@ -36,6 +39,39 @@ pub struct InputState {
     pub block_held: bool,
     /// If true, the next poll returns a Quit command exactly once.
     pub quit_requested: bool,
+    /// Current world-space view range (passed to the renderer). Starts
+    /// at `cfg.view_range` and is mutated by the zoom keys / wheel.
+    /// Held here (not in `ViewerConfig`) so the loaded TOML value stays
+    /// the "home" the user can snap back to with `0`.
+    pub view_range: f32,
+    /// Configured starting view range; the `0` key resets `view_range`
+    /// to this. Set once on startup.
+    pub view_range_home: f32,
+}
+
+/// Hard floor / ceiling on `view_range`. The floor stops the view from
+/// collapsing to a single pixel; the ceiling keeps the world-space
+/// camera from underflowing macroquad's NDC math at extreme zoom-out.
+const VIEW_RANGE_MIN: f32 = 4.0;
+const VIEW_RANGE_MAX: f32 = 4000.0;
+/// Per-press zoom factor for the `+` / `-` keys. 1.25× ≈ 9 presses to
+/// halve / double the view from any starting point.
+const KEY_ZOOM_FACTOR: f32 = 1.25;
+/// Per-wheel-notch zoom factor. Smaller than the keyboard step because
+/// wheels are continuous; this gives the user fine control.
+const WHEEL_ZOOM_FACTOR: f32 = 1.1;
+
+impl InputState {
+    /// Construct with the configured view range as both the current and
+    /// the "home" value (the `0` key reset target).
+    pub fn with_view_range(initial: f32) -> Self {
+        let clamped = initial.clamp(VIEW_RANGE_MIN, VIEW_RANGE_MAX);
+        Self {
+            view_range: clamped,
+            view_range_home: clamped,
+            ..Self::default()
+        }
+    }
 }
 
 /// One-shot action codes. Kept as a small set of `u8` constants rather
@@ -111,6 +147,40 @@ pub fn poll(state: &mut InputState) -> Vec<GuiCmd> {
     if is_key_pressed(KeyCode::K)     { cmds.push(GuiCmd::Action { action_type: action::HEAVY }); }
     if is_key_pressed(KeyCode::Space) { cmds.push(GuiCmd::Action { action_type: action::JUMP }); }
     if is_key_pressed(KeyCode::F)     { cmds.push(GuiCmd::Action { action_type: action::DODGE }); }
+
+    // ── Zoom: mouse wheel + keyboard. Compose factors first so pressing
+    // both `-` and scrolling-down in the same frame still ends up at a
+    // sane place; clamp once at the end to keep the window bounded
+    // even if `view_range` happens to be out of range from a previous
+    // frame's clamp.
+    let (_wheel_x, wheel_y) = mouse_wheel();
+    let mut zoom_factor = 1.0f32;
+    // Wheel up (positive y) zooms IN — view_range shrinks.
+    if wheel_y > 0.0 {
+        zoom_factor /= WHEEL_ZOOM_FACTOR;
+    } else if wheel_y < 0.0 {
+        zoom_factor *= WHEEL_ZOOM_FACTOR;
+    }
+    // `+` lives on KpAdd / Equal (with shift) on most layouts; accept
+    // both. Same for `-`. `KeyCode::Equal` covers the unshifted `=`
+    // because macroquad reports the physical key, not the produced char.
+    if is_key_pressed(KeyCode::KpAdd)
+        || is_key_pressed(KeyCode::Equal)
+    {
+        zoom_factor /= KEY_ZOOM_FACTOR;
+    }
+    if is_key_pressed(KeyCode::KpSubtract)
+        || is_key_pressed(KeyCode::Minus)
+    {
+        zoom_factor *= KEY_ZOOM_FACTOR;
+    }
+    if zoom_factor != 1.0 {
+        state.view_range = (state.view_range * zoom_factor)
+            .clamp(VIEW_RANGE_MIN, VIEW_RANGE_MAX);
+    }
+    if is_key_pressed(KeyCode::Key0) || is_key_pressed(KeyCode::Kp0) {
+        state.view_range = state.view_range_home;
+    }
 
     if is_key_pressed(KeyCode::Escape) || state.quit_requested {
         state.quit_requested = false;

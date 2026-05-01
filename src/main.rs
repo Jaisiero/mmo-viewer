@@ -73,7 +73,9 @@ async fn main() {
     let _net_thread = net::spawn(cfg.clone(), net);
 
     let mut world = World::default();
-    let mut input_state = InputState::default();
+    // Seed the input layer with the configured `view_range`, which it
+    // then owns and mutates in response to zoom keys / mouse wheel.
+    let mut input_state = InputState::with_view_range(cfg.view_range);
 
     loop {
         // 1. Drain whatever the net thread produced since the last frame.
@@ -124,7 +126,7 @@ async fn main() {
 
         // 3. Render. Any NetEvents we missed this frame will be picked
         //    up next frame — there's no visible latency at 60 Hz.
-        render::draw(&world, &cfg);
+        render::draw(&world, input_state.view_range);
 
         // Auth failures and action rejections stay visible in the HUD
         // rather than closing the window — the user can inspect and
