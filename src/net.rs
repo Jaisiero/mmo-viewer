@@ -172,6 +172,22 @@ async fn run_hot_loop(
     let mut last_input_tx = Instant::now();
     let mut last_ping_tx = Instant::now();
     let mut last_rtt_us = 0u64;
+
+    // Liveness probe: if `session_open` per the FSM but the server stops
+    // sending `StateAck` for this long, suspect an orphaned source
+    // session (handoff cleanup ran on the server, the player record is
+    // gone, but our UDP socket still appears alive) and reconnect via
+    // gateway. 3 s is well past worst-case server tick stalls (split
+    // coordinator can pause per-shard work briefly during region swaps,
+    // ~hundreds of ms) but short enough that the user notices recovery
+    // before they get bored. See entanglement-server#9 for the
+    // server-side root cause.
+    const LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
+    // `Instant::now()` rather than the wait-for-session-open moment
+    // because the server starts emitting StateAck immediately after
+    // SESSION_OPEN, so there's never a legitimate cold-start gap;
+    // any > 3 s gap is an anomaly we want to recover from.
+    let mut last_state_ack = Instant::now();
     // Last known world-space player position. We seed it from the
     // initial origin and keep it fresh from `StateAck` so a
     // gateway-bounce after a draining target shard can re-route to the
@@ -230,6 +246,17 @@ async fn run_hot_loop(
         let saw_disconnect = events
             .iter()
             .any(|e| matches!(e, GameEvent::Disconnected));
+        // Post-session-open `SessionAuthFailed` is the server's explicit
+        // "your session is gone, reconnect" signal — emitted by
+        // entanglement-server when a handoff cleanup tears down our
+        // source-shard slot. Treat it the same as `Disconnected` for
+        // the recovery path: try the gateway with last_pos before
+        // exiting. The reason code matters less than the fact that
+        // the server told us to leave; we don't try to interpret it
+        // beyond "go via gateway".
+        let saw_auth_failed = events
+            .iter()
+            .any(|e| matches!(e, GameEvent::SessionAuthFailed { .. }));
 
         for ev in events {
             // Track player position so a `RetryViaGateway` after a
@@ -237,6 +264,7 @@ async fn run_hot_loop(
             // (StateAck.x / .z is already world-space, not wire-relative).
             if let GameEvent::StateAck { x, z, .. } = &ev {
                 last_pos = (*x as f32, *z as f32);
+                last_state_ack = Instant::now();
             }
             // Defer Disconnected / ShardHandoffReceived to the
             // post-loop handler — emitting NetEvent::Disconnected here
@@ -282,12 +310,16 @@ async fn run_hot_loop(
             }
             // After a successful handoff, origin shifts; refresh
             // `last_pos` to the new origin so the next loop iteration
-            // doesn't carry stale wire-space coordinates.
+            // doesn't carry stale wire-space coordinates. Reset the
+            // liveness clock so the LIVENESS_TIMEOUT check doesn't
+            // immediately fire on the post-handoff window before the
+            // new shard's first StateAck arrives.
             last_pos = (
                 client.session.origin_x as f32,
                 client.session.origin_z as f32,
             );
-        } else if saw_disconnect {
+            last_state_ack = Instant::now();
+        } else if saw_disconnect || saw_auth_failed {
             // Grace period (mirrors mmo-cli/src/gameplay.rs:678-735):
             // a `Disconnected` without a preceding handoff might be the
             // shard tearing down the UDP socket microseconds before the
@@ -339,10 +371,57 @@ async fn run_hot_loop(
                     client.session.origin_x as f32,
                     client.session.origin_z as f32,
                 );
+                last_state_ack = Instant::now();
             } else {
-                let _ = net_events.send(NetEvent::Disconnected);
+                // Bare `Disconnected` after the handoff grace expired. The
+                // socket really is gone and no late SHARD_HANDOFF came. Try
+                // the gateway with our last known position before giving
+                // up — covers the orphan-source-session case where the
+                // shard cleaned up our handoff slot but the client never
+                // received SHARD_HANDOFF (server drops it during a split's
+                // brief routing limbo, packet loss on the control
+                // channel, etc.). One re-route via gateway gets us back
+                // on a live shard at last_pos. If that also fails, the
+                // viewer exits cleanly.
+                let _ = net_events.send(NetEvent::Status(
+                    "⟳ Disconnect — recovering via gateway".into(),
+                ));
+                if !retry_via_gateway(
+                    &mut client, cfg, &jwt, &mut gateway, last_pos, &net_events,
+                )
+                .await
+                {
+                    return;
+                }
+                last_pos = (
+                    client.session.origin_x as f32,
+                    client.session.origin_z as f32,
+                );
+                last_state_ack = Instant::now();
+            }
+        } else if last_state_ack.elapsed() > LIVENESS_TIMEOUT {
+            // Liveness probe: the FSM thinks we're connected but no
+            // StateAck has arrived for `LIVENESS_TIMEOUT`. Almost
+            // certainly an orphan source session — the server cleaned
+            // up our handoff slot but the UDP transport hasn't noticed.
+            // Trigger gateway recovery the same way a bare disconnect
+            // would, so the viewer never gets stuck staring at a frozen
+            // world.
+            let _ = net_events.send(NetEvent::Status(
+                "⟳ StateAck stale — recovering via gateway".into(),
+            ));
+            if !retry_via_gateway(
+                &mut client, cfg, &jwt, &mut gateway, last_pos, &net_events,
+            )
+            .await
+            {
                 return;
             }
+            last_pos = (
+                client.session.origin_x as f32,
+                client.session.origin_z as f32,
+            );
+            last_state_ack = Instant::now();
         }
 
         // 3. Send a PlayerMove at input_hz cadence regardless of whether
