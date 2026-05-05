@@ -73,6 +73,7 @@ pub fn draw(
     view_range: f32,
     regions: &SharedRegions,
     show_boundaries: bool,
+    move_to_target: Option<(f32, f32)>,
 ) {
     clear_background(Color::new(0.05, 0.05, 0.07, 1.0));
 
@@ -150,8 +151,31 @@ pub fn draw(
             // is identity outside the window — debugger philosophy
             // is preserved for normal frames.
             let (px, pz) = world.predicted_entity_pos(e);
-            draw_entity(e, px, pz);
+            // Resolve the shard whose region currently contains this
+            // entity, so `draw_entity` can paint a coloured outer ring
+            // matching the boundary overlay's hue. The lookup is the
+            // same `regions` snapshot the boundary draw uses, so the
+            // ring colour and the rectangle outline colour stay in
+            // sync without any extra protocol field.
+            let owning = locate_shard(regions, px, pz);
+            draw_entity(e, px, pz, owning.as_deref());
         }
+    }
+
+    // Click-to-move target marker. Drawn after entities so it sits on
+    // top, before HUD swap so it lives in world space (the line scales
+    // with the view, the dot keeps a consistent screen-pixel size). A
+    // line from the player to the destination plus a ring at the
+    // destination is enough visual feedback to confirm "yes, the click
+    // registered, and your bot is heading there"; we deliberately don't
+    // path-plan or draw a curve since the server walks straight-line.
+    if let Some((tx, tz)) = move_to_target {
+        let stroke = (view_range / 200.0).clamp(0.5, 4.0);
+        let ring_r = (view_range / 60.0).clamp(0.6, 5.0);
+        let target_col = Color::new(0.30, 0.95, 0.55, 0.85); // bright green
+        draw_line(self_x, self_z, tx, tz, stroke, target_col);
+        draw_circle_lines(tx, tz, ring_r, stroke, target_col);
+        draw_circle(tx, tz, ring_r * 0.25, target_col);
     }
 
     // ── HUD pass ─────────────────────────────────────────────────────
@@ -230,33 +254,83 @@ fn draw_grid(cx: f32, cz: f32, range_x: f32, range_y: f32) {
     }
 }
 
-/// Draw a neighbour entity: a filled circle whose colour is derived
-/// from hp (green→red) and whose outline is tinted by combat_state.
+/// Resolve the shard whose region currently contains `(x, z)`.
+/// Returns `None` if no region matches (entity is outside every
+/// known region — shouldn't happen in steady state, but can during
+/// a brief window mid-cutover when the regions list is stale).
+///
+/// Linear scan over the regions vec; cluster size is small (handful
+/// of shards) so a `find` is fine and avoids a per-shard hash map.
+fn locate_shard(regions: &SharedRegions, x: f32, z: f32) -> Option<String> {
+    let regions = regions.read().ok()?;
+    regions
+        .iter()
+        .find(|r| x >= r.x_min && x < r.x_max && z >= r.z_min && z < r.z_max)
+        .map(|r| r.shard_id.clone())
+}
+
+/// Draw a neighbour entity: a filled red dot in the centre with a
+/// larger ring around it whose colour matches the shard claiming
+/// authority over the entity (= the shard whose region contains the
+/// entity's `(x, z)`). Stable shard→hue mapping comes from
+/// `boundaries::shard_colour`, which the boundary-overlay rectangles
+/// already use, so the ring matches the rectangle outline colour and
+/// the user can identify shard membership at a glance.
 ///
 /// `x` / `z` are passed explicitly so the caller can substitute a
 /// dead-reckoned position during the handoff window. Outside the
 /// window they're just `e.x` / `e.z`.
-fn draw_entity(e: &Entity, x: f32, z: f32) {
-    const R: f32 = 0.8;
-    // HP-fraction lerp from red to green.
-    let hp = e.hp_frac();
-    let body = Color::new(1.0 - hp, hp, 0.2, 1.0);
-    draw_circle(x, z, R, body);
+///
+/// `owning_shard_id` is `None` while the entity sits outside every
+/// known region (transient mid-cutover or boundary-poll lag); we
+/// fall back to a neutral grey ring so the entity is still visible
+/// without falsely claiming any shard.
+fn draw_entity(e: &Entity, x: f32, z: f32, owning_shard_id: Option<&str>) {
+    /// Inner red dot — kept small so the shard-coloured ring around
+    /// it dominates visually while the dot still anchors the entity
+    /// position.
+    const CORE_R: f32 = 0.5;
+    /// Outer shard ring. Bigger than the previous body circle so the
+    /// hue is unmistakable even at the bench-D-style densities where
+    /// 480 bots share a 30-metre column.
+    const RING_R: f32 = 1.1;
 
-    // Outline colour = combat state tint. State id 0 is "idle" in mmo
-    // shard conventions; anything non-zero gets a yellow halo so state
-    // changes pop without the viewer having to decode the enum.
-    let outline = if e.combat_state == 0 {
-        Color::new(0.0, 0.0, 0.0, 1.0)
-    } else {
-        Color::new(1.0, 0.9, 0.2, 1.0)
+    // Inner red dot — kept solid red regardless of HP so the shard
+    // ring colour is the primary visual signal. A future iteration
+    // could re-encode HP as the dot's saturation if needed; for the
+    // current "which shard owns this bot" question, redundancy
+    // between dot colour and ring colour is more confusing than
+    // helpful.
+    let core_col = Color::new(0.95, 0.20, 0.20, 1.0);
+    draw_circle(x, z, CORE_R, core_col);
+
+    // Outer ring tinted by the owning shard. `boundaries::shard_colour`
+    // is the same hue the boundary-overlay rectangles use, so the
+    // ring matches the rectangle stroke for the region the entity
+    // sits in. Grey fallback for entities outside every known region.
+    let ring_col = match owning_shard_id {
+        Some(id) => {
+            let (r, g, b) = shard_colour(id);
+            Color::new(r, g, b, 1.0)
+        }
+        None => Color::new(0.55, 0.55, 0.55, 1.0),
     };
-    draw_circle_lines(x, z, R, 0.08, outline);
+    // Ring is a thick stroked circle — the line thickness scales with
+    // RING_R so the colour band is wide enough to read at the typical
+    // bench-D zoom level (~50-200 unit view_range).
+    draw_circle_lines(x, z, RING_R, 0.18, ring_col);
+
+    // Combat-state halo: state id 0 is "idle"; anything non-zero gets
+    // a yellow inner stroke just inside the shard ring so state
+    // changes still pop without overriding the shard colour.
+    if e.combat_state != 0 {
+        draw_circle_lines(x, z, CORE_R + 0.15, 0.08, Color::new(1.0, 0.9, 0.2, 1.0));
+    }
 
     // Orientation tick: short line from centre in the facing direction.
-    let tx = x + e.orientation.cos() * (R * 1.4);
-    let tz = z + e.orientation.sin() * (R * 1.4);
-    draw_line(x, z, tx, tz, 0.10, WHITE);
+    let tx = x + e.orientation.cos() * (RING_R * 1.1);
+    let tz = z + e.orientation.sin() * (RING_R * 1.1);
+    draw_line(x, z, tx, tz, 0.08, WHITE);
 }
 
 /// Draw the player as a triangle with its apex in the facing direction.
