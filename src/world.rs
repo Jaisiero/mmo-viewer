@@ -63,6 +63,15 @@ pub struct Entity {
     /// entity once the position update lands and any subsequent
     /// Health/State delta from the server.
     pub has_position: bool,
+    /// FNV-1a hash of the shard that last broadcast this entity's
+    /// position. Stamped from `EntityMove[Compact].source_shard_hash`
+    /// on every update — the renderer paints the entity's outer ring
+    /// using `boundaries::shard_colour(...)` keyed on this value so
+    /// authority transitions show up the same tick the wire reports
+    /// them. `0` while no Move has landed yet (or sender is older
+    /// than the wire-format change); renderer falls back to a
+    /// neutral grey ring for that case.
+    pub source_shard_hash: u32,
 }
 
 impl Entity {
@@ -79,6 +88,7 @@ impl Entity {
             last_seen: Instant::now(),
             is_self: false,
             has_position: false,
+            source_shard_hash: 0,
         }
     }
 
@@ -298,16 +308,22 @@ impl World {
                 y,
                 z,
                 orientation,
+                source_shard_hash,
             } => {
                 // The local player's authoritative position lives on
                 // `StateAck`; if the server happens to also broadcast
                 // self via EntityMove (some configs do), don't let it
                 // double-write here — the two sources update at
                 // slightly different cadences and would race. We still
-                // refresh `last_seen` so pruning doesn't misfire.
+                // refresh `last_seen` so pruning doesn't misfire, AND
+                // we still record `source_shard_hash` so the local
+                // player's ring colour follows authority transfers
+                // (the user's ring should change colour the tick the
+                // handoff lands).
                 if entity_id == self.persistent_id {
                     if let Some(e) = self.entities.get_mut(&entity_id) {
                         e.last_seen = Instant::now();
+                        e.source_shard_hash = source_shard_hash;
                     }
                     return;
                 }
@@ -324,6 +340,7 @@ impl World {
                 e.y = y;
                 e.z = z + self.origin_z as f32;
                 e.orientation = orientation;
+                e.source_shard_hash = source_shard_hash;
                 e.last_seen = Instant::now();
                 e.has_position = true;
             }

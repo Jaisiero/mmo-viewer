@@ -151,13 +151,16 @@ pub fn draw(
             // is identity outside the window — debugger philosophy
             // is preserved for normal frames.
             let (px, pz) = world.predicted_entity_pos(e);
-            // Resolve the shard whose region currently contains this
-            // entity, so `draw_entity` can paint a coloured outer ring
-            // matching the boundary overlay's hue. The lookup is the
-            // same `regions` snapshot the boundary draw uses, so the
-            // ring colour and the rectangle outline colour stay in
-            // sync without any extra protocol field.
-            let owning = locate_shard(regions, px, pz);
+            // Look up the broadcasting shard's id from the wire-stamped
+            // `source_shard_hash` (carried verbatim from
+            // EntityMove[Compact]). This is the authoritative answer
+            // for "which shard owns this entity" — the previous
+            // version inferred from `(x, z)` ↔ region geometry,
+            // which lies whenever a handoff is mid-flight or has
+            // failed silently (the bug the user observed: their
+            // session stayed on the old shard while their character
+            // visibly moved into a region another shard claimed).
+            let owning = lookup_shard_by_hash(regions, e.source_shard_hash);
             draw_entity(e, px, pz, owning.as_deref());
         }
     }
@@ -254,83 +257,103 @@ fn draw_grid(cx: f32, cz: f32, range_x: f32, range_y: f32) {
     }
 }
 
-/// Resolve the shard whose region currently contains `(x, z)`.
-/// Returns `None` if no region matches (entity is outside every
-/// known region — shouldn't happen in steady state, but can during
-/// a brief window mid-cutover when the regions list is stale).
+/// Look up a shard by its FNV-1a hash. The boundary-poll snapshot
+/// carries each shard's `shard_id` string; we hash with the same
+/// `peer::shard_id_hash` convention the server uses so a wire-stamped
+/// `source_shard_hash` can be matched back to the original `shard_id`
+/// for `boundaries::shard_colour`. Returns `None` if no known shard
+/// has a matching hash (e.g. the boundary poll is stale relative to
+/// a freshly-spawned shard, or `hash == 0` meaning "unknown sender").
 ///
 /// Linear scan over the regions vec; cluster size is small (handful
-/// of shards) so a `find` is fine and avoids a per-shard hash map.
-fn locate_shard(regions: &SharedRegions, x: f32, z: f32) -> Option<String> {
+/// of shards) so per-frame `find` is fine.
+fn lookup_shard_by_hash(regions: &SharedRegions, hash: u32) -> Option<String> {
+    if hash == 0 { return None; }
     let regions = regions.read().ok()?;
     regions
         .iter()
-        .find(|r| x >= r.x_min && x < r.x_max && z >= r.z_min && z < r.z_max)
+        .find(|r| fnv1a_shard_hash(&r.shard_id) == hash)
         .map(|r| r.shard_id.clone())
 }
 
-/// Draw a neighbour entity: a filled red dot in the centre with a
-/// larger ring around it whose colour matches the shard claiming
-/// authority over the entity (= the shard whose region contains the
-/// entity's `(x, z)`). Stable shard→hue mapping comes from
-/// `boundaries::shard_colour`, which the boundary-overlay rectangles
-/// already use, so the ring matches the rectangle outline colour and
-/// the user can identify shard membership at a glance.
+/// FNV-1a hash matching `entanglement-server::peer::shard_id_hash`.
+/// Mirrored here so the viewer can resolve a wire-stamped
+/// `source_shard_hash` back to a `shard_id` without depending on
+/// the server crate.
+fn fnv1a_shard_hash(id: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in id.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Draw a neighbour entity as three concentric layers:
+///
+///   ◯ outer thin red ring   ← visual anchor, always red
+///   ◯ shard-colour ring     ← authoritative owner at a glance
+///   • inner red core        ← dot you can hit-test against
+///
+/// The shard colour comes from `Entity::source_shard_hash` (stamped
+/// on the wire by the broadcasting shard), NOT from inferring "which
+/// region currently contains `(x, z)`" — geometry-based inference
+/// lies whenever a handoff is mid-flight or has failed silently
+/// (exactly the failure mode the user reported: their session stayed
+/// on the old shard while their character moved into a neighbour's
+/// region; the geometry-based ring would have falsely claimed the
+/// neighbour owned them).
 ///
 /// `x` / `z` are passed explicitly so the caller can substitute a
 /// dead-reckoned position during the handoff window. Outside the
 /// window they're just `e.x` / `e.z`.
 ///
-/// `owning_shard_id` is `None` while the entity sits outside every
-/// known region (transient mid-cutover or boundary-poll lag); we
-/// fall back to a neutral grey ring so the entity is still visible
-/// without falsely claiming any shard.
+/// `owning_shard_id` is `None` when `source_shard_hash == 0` (sender
+/// is older than the wire-format change) or no boundary-poll entry
+/// matches the hash. The shard ring is rendered grey in that case
+/// so the entity remains visible without falsely claiming any
+/// shard.
 fn draw_entity(e: &Entity, x: f32, z: f32, owning_shard_id: Option<&str>) {
-    /// Inner red dot — kept small so the shard-coloured ring around
-    /// it dominates visually while the dot still anchors the entity
-    /// position.
-    const CORE_R: f32 = 0.5;
-    /// Outer shard ring. Bigger than the previous body circle so the
-    /// hue is unmistakable even at the bench-D-style densities where
-    /// 480 bots share a 30-metre column.
-    const RING_R: f32 = 1.1;
+    // Sizes deliberately small — the visual is the layered colour
+    // band, not raw radius. Total visible diameter ≈ 1 unit at the
+    // typical bench-D zoom level (`view_range` ~50–250 units), which
+    // matches the previous "single circle" footprint without
+    // crowding the boundary line.
+    const OUTER_R: f32 = 0.55; // outer red ring
+    const SHARD_R: f32 = 0.40; // shard-colour ring (between outer and core)
+    const CORE_R:  f32 = 0.18; // inner red dot
 
-    // Inner red dot — kept solid red regardless of HP so the shard
-    // ring colour is the primary visual signal. A future iteration
-    // could re-encode HP as the dot's saturation if needed; for the
-    // current "which shard owns this bot" question, redundancy
-    // between dot colour and ring colour is more confusing than
-    // helpful.
-    let core_col = Color::new(0.95, 0.20, 0.20, 1.0);
-    draw_circle(x, z, CORE_R, core_col);
-
-    // Outer ring tinted by the owning shard. `boundaries::shard_colour`
-    // is the same hue the boundary-overlay rectangles use, so the
-    // ring matches the rectangle stroke for the region the entity
-    // sits in. Grey fallback for entities outside every known region.
-    let ring_col = match owning_shard_id {
+    let red = Color::new(0.95, 0.20, 0.20, 1.0);
+    let shard_col = match owning_shard_id {
         Some(id) => {
             let (r, g, b) = shard_colour(id);
             Color::new(r, g, b, 1.0)
         }
         None => Color::new(0.55, 0.55, 0.55, 1.0),
     };
-    // Ring is a thick stroked circle — the line thickness scales with
-    // RING_R so the colour band is wide enough to read at the typical
-    // bench-D zoom level (~50-200 unit view_range).
-    draw_circle_lines(x, z, RING_R, 0.18, ring_col);
 
-    // Combat-state halo: state id 0 is "idle"; anything non-zero gets
-    // a yellow inner stroke just inside the shard ring so state
-    // changes still pop without overriding the shard colour.
+    // ── Layer 1: outer thin red ring ─────────────────────────────
+    draw_circle_lines(x, z, OUTER_R, 0.06, red);
+    // ── Layer 2: shard-colour ring ───────────────────────────────
+    // Thicker stroke so the hue is legible — the band lives between
+    // CORE_R and OUTER_R, so the inner red core and outer red ring
+    // both sit cleanly outside it.
+    draw_circle_lines(x, z, SHARD_R, 0.13, shard_col);
+    // ── Layer 3: inner red core ──────────────────────────────────
+    draw_circle(x, z, CORE_R, red);
+
+    // Combat-state halo: state id 0 is "idle"; non-zero gets a
+    // yellow stroke between the shard ring and outer red so state
+    // changes still pop without overriding the layered structure.
     if e.combat_state != 0 {
-        draw_circle_lines(x, z, CORE_R + 0.15, 0.08, Color::new(1.0, 0.9, 0.2, 1.0));
+        draw_circle_lines(x, z, (SHARD_R + OUTER_R) * 0.5, 0.04,
+                          Color::new(1.0, 0.9, 0.2, 1.0));
     }
 
     // Orientation tick: short line from centre in the facing direction.
-    let tx = x + e.orientation.cos() * (RING_R * 1.1);
-    let tz = z + e.orientation.sin() * (RING_R * 1.1);
-    draw_line(x, z, tx, tz, 0.08, WHITE);
+    let tx = x + e.orientation.cos() * (OUTER_R * 1.2);
+    let tz = z + e.orientation.sin() * (OUTER_R * 1.2);
+    draw_line(x, z, tx, tz, 0.05, WHITE);
 }
 
 /// Draw the player as a triangle with its apex in the facing direction.

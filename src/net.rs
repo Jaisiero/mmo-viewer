@@ -495,12 +495,14 @@ fn map_event(ev: GameEvent) -> Option<NetEvent> {
             y,
             z,
             orientation,
+            source_shard_hash,
         } => Some(NetEvent::EntityMoved {
             entity_id,
             x,
             y,
             z,
             orientation,
+            source_shard_hash,
         }),
         GameEvent::HitConfirm {
             target_id,

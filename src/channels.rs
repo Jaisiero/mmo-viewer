@@ -59,6 +59,15 @@ pub enum NetEvent {
         y: f32,
         z: f32,
         orientation: f32,
+        /// FNV-1a hash of the shard that broadcast this update.
+        /// Forwarded verbatim from `EntityMove[Compact].source_shard_hash`
+        /// — the renderer paints the entity's outer ring with this
+        /// shard's hue so we can see authority changes the moment
+        /// the wire reports them, instead of inferring from
+        /// `(x, z)` ↔ region overlap.
+        /// `0` means "unknown" (an older sender without the field);
+        /// the renderer falls back to a neutral grey ring.
+        source_shard_hash: u32,
     },
 
     /// Damage landed on some entity (us or another).

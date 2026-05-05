@@ -414,7 +414,7 @@ dependencies = [
 [[package]]
 name = "entanglement-net"
 version = "0.1.0"
-source = "git+https://github.com/Jaisiero/entanglement-net.git#f08450cbb67ec970ff3577d88421436b6d7f1198"
+source = "git+https://github.com/Jaisiero/entanglement-net.git#a25251a4cd7559e78a749c059c57e16b8fe183f6"
 dependencies = [
  "thiserror",
 ]
@@ -996,7 +996,7 @@ dependencies = [
 [[package]]
 name = "mmo-cli"
 version = "0.1.0"
-source = "git+https://github.com/Jaisiero/mmo-cli.git#1b01a352abe559912ca2190a795f8a042fe7ba41"
+source = "git+https://github.com/Jaisiero/mmo-cli.git#bc4553e25816b32a1d7356fbea4ed4595f73ee90"
 dependencies = [
  "config",
  "crossterm",
