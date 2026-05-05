@@ -94,6 +94,11 @@ impl Entity {
 
     /// HP as a fraction in [0, 1] for tinting. Guards against zero max_hp
     /// (freshly created entities where only a Move has arrived so far).
+    /// Currently unused — the previous "tint dot by HP" render was
+    /// replaced by the layered red/shard/red ring scheme — but kept
+    /// around because a future HUD slot or hover tooltip will want it
+    /// without re-deriving the math.
+    #[allow(dead_code)]
     pub fn hp_frac(&self) -> f32 {
         if self.max_hp == 0 {
             0.0
