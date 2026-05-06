@@ -343,11 +343,16 @@ fn draw_entity(e: &Entity, x: f32, z: f32, owning_shard_id: Option<&str>) {
     draw_circle(x, z, CORE_R, red);
 
     // Combat-state halo: state id 0 is "idle"; non-zero gets a
-    // yellow stroke between the shard ring and outer red so state
-    // changes still pop without overriding the layered structure.
+    // bright-white stroke between the shard ring and outer red so
+    // state changes pop without ambiguity. Was yellow originally,
+    // but yellow conflicted with the auto-generated yellow shard
+    // colour produced by hashing certain UUIDs (cluster booted with
+    // a shard whose djb2 hue landed at 58° — same as the halo).
+    // White is the only colour guaranteed to never collide with the
+    // hand-picked SHARD_PALETTE in `boundaries.rs`.
     if e.combat_state != 0 {
         draw_circle_lines(x, z, (SHARD_R + OUTER_R) * 0.5, 0.04,
-                          Color::new(1.0, 0.9, 0.2, 1.0));
+                          Color::new(1.0, 1.0, 1.0, 1.0));
     }
 
     // Orientation tick: short line from centre in the facing direction.

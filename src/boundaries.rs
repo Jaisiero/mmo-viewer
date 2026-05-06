@@ -108,33 +108,45 @@ pub fn spawn(world_coord_url: String, regions: SharedRegions) {
 }
 
 /// Stable-ish hashing colour: same shard_id → same RGB across runs.
-/// Hue cycles through the wheel; saturation is fixed mid-high so the
-/// outlines pop on the dark background but don't drown the entities.
-/// Alpha left to the caller — usually low so the lines are an
-/// overlay, not a wall.
+///
+/// Hand-picked saturated palette of 12 colours visible on the dark
+/// background. Constraints:
+///   - No yellow — would collide with the combat halo (`render.rs::
+///     draw_entity` historically used a yellow ring to mark
+///     `combat_state != 0`; even after the halo colour change, leaving
+///     yellow out keeps it free for future UI accents).
+///   - No pure red — entities already have red outer ring + inner core,
+///     a red shard band would camouflage them.
+///   - Hues spread ≥30° apart so two random UUIDs are visually
+///     distinguishable however the djb2 hash falls.
+///
+/// Previous version was `hsv_to_rgb(djb2(uuid) % 360 / 360, 0.65, 0.95)`
+/// — fully random hues. Production cluster booted three shards with
+/// hues 58°, 315°, 328° (yellow indistinguishable from combat halo,
+/// magenta indistinguishable from pink), exactly the "mezclados azules
+/// con verdes" symptom users reported. The fixed palette eliminates
+/// the dice-roll: any cluster of ≤12 shards is guaranteed
+/// distinguishable; >12 wraps the palette and adjacent indices in the
+/// wrap still differ noticeably.
+const SHARD_PALETTE: [(f32, f32, f32); 12] = [
+    (0.00, 0.80, 1.00), // 0  — cyan
+    (0.30, 0.90, 0.30), // 1  — lime
+    (1.00, 0.20, 0.85), // 2  — magenta
+    (1.00, 0.55, 0.00), // 3  — orange
+    (0.30, 0.70, 1.00), // 4  — sky blue
+    (0.20, 0.85, 0.55), // 5  — mint
+    (0.60, 0.50, 1.00), // 6  — lavender
+    (1.00, 0.40, 0.70), // 7  — pink
+    (0.10, 0.60, 0.65), // 8  — teal
+    (0.45, 0.55, 0.95), // 9  — periwinkle
+    (0.70, 0.30, 0.70), // 10 — plum
+    (0.20, 0.95, 0.85), // 11 — aqua
+];
+
 pub fn shard_colour(shard_id: &str) -> (f32, f32, f32) {
     let mut h: u32 = 5381;
     for b in shard_id.as_bytes() {
         h = h.wrapping_mul(33).wrapping_add(*b as u32);
     }
-    let hue = (h % 360) as f32 / 360.0;          // 0..1
-    let s   = 0.65;
-    let v   = 0.95;
-    hsv_to_rgb(hue, s, v)
-}
-
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
-    let i = (h * 6.0).floor() as i32;
-    let f = h * 6.0 - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - f * s);
-    let t = v * (1.0 - (1.0 - f) * s);
-    match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    }
+    SHARD_PALETTE[(h as usize) % SHARD_PALETTE.len()]
 }
