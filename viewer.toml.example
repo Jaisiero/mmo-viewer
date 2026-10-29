@@ -4,10 +4,9 @@
 # Defaults live in src/config.rs; anything omitted here falls back to them.
 
 # ── Network endpoints ──────────────────────────────────────────────────────
-# Point these at whichever stack you want to poke at. Defaults are localhost,
-# the values below are the dev cluster (alpha auth + beta gateway).
-auth_service_url = "http://192.168.1.13:50051"
-gateway_url      = "http://192.168.1.12:8090"
+# Point these at whichever stack you want to poke at. Defaults are localhost.
+auth_service_url = "http://127.0.0.1:50051"
+gateway_url      = "http://127.0.0.1:8090"
 
 # ── Auth timing (same semantics as mmo-cli/client.toml) ────────────────────
 session_auth_retries    = 3
@@ -19,7 +18,7 @@ input_redundancy        = 3
 # The viewer issues a best-effort `register` before logging in, so an
 # unused name will self-provision on a dev stack.
 username = "viewer"
-password = "viewer"
+password = "change-me"
 
 # ── Initial spawn position (used only if auth-service has no saved state) ──
 start_x = 0.0
